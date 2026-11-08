@@ -350,6 +350,7 @@ jobs:
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
+            -DENABLE_WERROR=OFF \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
