@@ -275,15 +275,33 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
-    if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+    // Preflushable data is downloaded at fences, but only where it is marked: the rest of the
+    // range still needs this flush.
+    if (memory_tracker.IsRegionPreflushable(device_addr, size) &&
+        !HasGpuWritesNotDownloadedAtFence(device_addr_start_aligned,
+                                          device_addr_end_aligned - device_addr_start_aligned)) {
         area->preemtive = true;
+        // The core keeps this area: a later GPU write to its unmarked pages must arm them again.
+        read_trapped_ranges.Subtract(device_addr_start_aligned,
+                                     device_addr_end_aligned - device_addr_start_aligned);
         return area;
     };
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
-    // instead keep read traps and flush on demand.
-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    // instead keep read traps and flush on demand, except Ocarina of Time: its CPU reads ~200
+    // GPU-written pages a second, and each on-demand flush stalled both its CPU and the GPU
+    // thread on the host GPU (45 -> 50 fps in Kokiri Forest on an RX 9070 XT, no flashes seen
+    // with EDEN_NX2_FLASH_WATCH). EDEN_NX2_PREFLUSH=1/0 forces either.
+    static const int forced_preflush = [] {
+        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+    }();
+    constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+    const bool preflush = forced_preflush >= 0 ? forced_preflush == 1
+                          : program_id == ocarina_of_time
+                              ? true
+                              : !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
