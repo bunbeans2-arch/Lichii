@@ -175,6 +175,31 @@ u64 GpuSplit::TrackedWritePosition(const void* space, u64 begin, u64 end) {
     return BlocksPosition(write_blocks, space, begin, end);
 }
 
+namespace {
+constexpr u64 FineBlockShift = 4;
+} // Anonymous namespace
+
+void GpuSplit::NoteFineBlocks(const void* space, u64 begin, u64 end) {
+    ForEachBlockKey(space, begin, end, FineBlockShift,
+                    [&](u64 key) { fine_blocks[key] = write_position; });
+}
+
+u64 GpuSplit::FineReadyPosition(const void* space, u64 begin, u64 end) {
+    u64 target = MemoryBarrierPosition();
+    if (end <= begin || fine_blocks.empty() || latest_block_write <= target) {
+        return target;
+    }
+    if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
+        return std::max(target, latest_block_write);
+    }
+    ForEachBlockKey(space, begin, end, FineBlockShift, [&](u64 key) {
+        if (const auto it = fine_blocks.find(key); it != fine_blocks.end()) {
+            target = std::max(target, it->second);
+        }
+    });
+    return target;
+}
+
 void GpuSplit::Stop() {
     if (!back_thread.joinable()) {
         return;
@@ -194,6 +219,7 @@ void GpuSplit::Stop() {
     last_barrier_position = 0;
     write_blocks.clear();
     opaque_blocks.clear();
+    fine_blocks.clear();
     latest_block_write = 0;
     latest_opaque_write = 0;
     last_sync_position = 0;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -229,13 +230,18 @@ public:
         if (write_blocks.size() >= 8192 && Consumed() >= latest_block_write) {
             write_blocks.clear();
             opaque_blocks.clear();
+            fine_blocks.clear();
         }
         if (write_blocks.size() >= 65536) {
             write_blocks.clear();
             opaque_blocks.clear();
+            fine_blocks.clear();
             NoteMemoryBarrier(0x40000);
         }
         NoteBlocks(write_blocks, space, begin, end);
+        if (fine_stats) [[unlikely]] {
+            NoteFineBlocks(space, begin, end);
+        }
         latest_block_write = write_position;
         if (opaque) {
             NoteBlocks(opaque_blocks, space, begin, end);
@@ -253,6 +259,11 @@ public:
     }
     /// The position after the last queued tracked write to [begin, end), untracked writes aside.
     [[nodiscard]] u64 TrackedWritePosition(const void* space, u64 begin, u64 end);
+
+    /// EDEN_NX2_MME_DMA_STATS (diagnostic): ReadReadyPosition with 16-byte instead of 64-byte
+    /// blocks, to count reads that wait only for a neighbouring write in the same 64 bytes.
+    static inline const bool fine_stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+    [[nodiscard]] u64 FineReadyPosition(const void* space, u64 begin, u64 end);
 
 private:
     friend struct GpuSplitTestAccess;
@@ -334,6 +345,8 @@ private:
     static constexpr u64 MaxWriteBlocks = 1024;
     std::unordered_map<u64, u64> write_blocks;
     std::unordered_map<u64, u64> opaque_blocks;
+    std::unordered_map<u64, u64> fine_blocks; ///< fine_stats only: 16-byte blocks
+    void NoteFineBlocks(const void* space, u64 begin, u64 end);
     u64 latest_block_write{};
     u64 latest_opaque_write{};
     // Keyed by the backing memory (`space` is a Tegra::MemoryManager), so writes and reads

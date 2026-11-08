@@ -1613,13 +1613,28 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  : target == barrier ? 2
                                                      : 3;
             ++causes[cause];
+            // "constant buffer" = any tracked queued write (constant buffer words, reports,
+            // semaphore releases). With 16-byte blocks instead of 64: would it wait at all
+            // (neighbour only), or for an earlier position (shorter)?
+            static u64 neighbour_only{};
+            static u64 shorter{};
+            if (cause == 3) {
+                const u64 fine = split.FineReadyPosition(&memory_manager, source, source + read_bytes);
+                if (fine <= consumed) {
+                    ++neighbour_only;
+                } else if (fine < target) {
+                    ++shorter;
+                }
+            }
             static std::unordered_map<u32, u64> sources;
             if (cause == 2) {
                 ++sources[split.MemoryBarrierSource()];
             }
             if (((causes[0] + causes[1] + causes[2] + causes[3]) & 0xffff) == 0) {
-                LOG_INFO(HW_GPU, "MME DMA reads: no wait {}, writer {}, barrier {}, constant buffer {}",
-                         causes[0], causes[1], causes[2], causes[3]);
+                LOG_INFO(HW_GPU,
+                         "MME DMA reads: no wait {}, writer {}, barrier {}, constant buffer {} "
+                         "(16-byte blocks: neighbour only {}, shorter {})",
+                         causes[0], causes[1], causes[2], causes[3], neighbour_only, shorter);
                 for (const auto& [source, count] : sources) {
                     LOG_INFO(HW_GPU, "MME DMA read barrier source {:#x}: {}", source, count);
                 }
