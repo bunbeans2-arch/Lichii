@@ -331,7 +331,8 @@ jobs:
         run: |
           set -euo pipefail
           profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin \
-            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date \
+            -Wno-error=unknown-pragmas -Wno-error=shadow"
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
