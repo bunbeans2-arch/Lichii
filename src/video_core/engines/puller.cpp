@@ -451,6 +451,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
     } else {
         DrainBack();
+        // Drained: the back is idle, so a direct Break is ordered (as ProcessSemaphoreAcquire).
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             regs.acquire_source = true;
@@ -526,6 +528,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         NoteRelease(address, payload);
         return;
     }
+    // As the Ampere trigger acquire: the own-release and stable exits below return before the
+    // drained Break, so end fast draw reuse in stream order first (H17 review of v3).
+    OnBack([] { VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence); });
     auto& split = VideoCommon::GpuSplit::Get();
     if (operation <= 3 && operation != 1) {
         // This channel's own queued release meets it before anything sent after the acquire.
