@@ -488,6 +488,24 @@ public:
         u64 epoch{};
     };
     std::unordered_map<DAddr, NativePageSnapshot> native_indirect_page_snapshots;
+    /// Clears of native_indirect_page_snapshots so far (they drop every page's stamp).
+    u64 native_snapshot_clears{};
+    /// LICHII_BANK_PAGE_MEMO: bank pages known to be mapped and stamped with the current guest
+    /// sync epoch in native_indirect_page_snapshots, so a bind skips their GetPointer and hash
+    /// lookup (the walk would find them and skip them anyway). An entry holds while its token
+    /// is current; the token changes with the epoch, the device memory's Map/Unmap generation
+    /// and the snapshot clears.
+    struct BankPageMemo {
+        DAddr page{~DAddr{0}};
+        u64 token{}; ///< 0 never matches
+    };
+    std::array<BankPageMemo, 1024> bank_page_memo{};
+    u64 bank_page_memo_token{1};
+    u64 bank_page_memo_epoch{};
+    u64 bank_page_memo_translation{};
+    u64 bank_page_memo_clears{};
+    /// The epoch walk over a native bank's pages, with bank_page_memo.
+    void CheckNativeBankPagesMemo(DAddr device_addr, u32 size);
 
 private:
     template <typename Mask, typename Func>

@@ -83,6 +83,19 @@ inline bool Enabled() {
     return g_enabled;
 }
 
+// EDEN_NX2_PROFILE_FAST=1 (with the profile): keep the fast 3D method path the unprofiled build
+// runs (Maxwell3D::fast_maxwell3d), and time the split back's method work per batch of entries
+// instead of per method. Without it the profile times CallMethodSlow, which a normal run never
+// takes for most writes. Per-method write counts are not kept in this mode.
+inline const bool g_fast_methods = g_enabled && [] {
+    const char* value = std::getenv("EDEN_NX2_PROFILE_FAST");
+    return value != nullptr && value[0] == '1';
+}();
+
+inline bool FastMethods() {
+    return g_fast_methods;
+}
+
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
 // run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread).
 inline u64 Now() {
