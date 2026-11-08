@@ -268,7 +268,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                  static_cast<u32>(counter_type), static_cast<u32>(flags), payload, gpu_memory->GetID(),
                  gpu_memory->GpuToCpuAddress(addr).value_or(0));
     }
-    if (counter_type == QueryType::ZPassPixelCount64 && !is_fence && FakeOcclusionSamples() != 0) {
+    if (counter_type == QueryType::ZPassPixelCount64 && FakeOcclusionSamples() != 0) {
         // Written like a payload: at once with GPU accuracy below High.
         counter_type = QueryType::Payload;
         payload = FakeOcclusionSamples();
