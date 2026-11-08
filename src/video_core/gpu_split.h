@@ -322,8 +322,10 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front side. Starts on its own cache line: the back reads `system` and `ring` above for every
+    // entry, and the front writes these fields on every push (false sharing showed up as ~5% of
+    // the back thread in a sampled profile).
+    alignas(64) u64 write_position{};
     u64 last_writer_position{};
     u64 last_barrier_position{};
     u32 last_barrier_source{};
@@ -357,8 +359,8 @@ private:
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side. Own cache line: read for every entry, away from publish_every/front_engine.
+    alignas(64) Tegra::Engines::EngineInterface* back_engine{};
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
