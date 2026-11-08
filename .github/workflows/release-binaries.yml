@@ -80,30 +80,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          # The Linux -pgo builds are the same programs compiled by clang against the repo's
-          # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
-          # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
-          # about the same speed. Both Windows builds are clang-cl with ThinLTO; windows-x86_64-pgo
-          # adds lichii-windows.profdata, an MSVC-ABI profile trained on Ocarina of Time (see
-          # docs/CI.md). MSVC still builds for development.
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
-          - platform: windows-x86_64
+          - platform: windows-x86_64-pgogen
             runner: windows-2022
-          - platform: windows-x86_64-pgo
-            runner: windows-2022
-            pgo: true
-            profile: lichii-windows.profdata
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: macos-arm64
-            runner: macos-15
+            pgogen: true
 
     steps:
       - name: Check out source
@@ -301,6 +280,13 @@ jobs:
         run: |
           set -euo pipefail
           flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
+          linkflags=""
+          if [ '${{ matrix.pgogen }}' = 'true' ]; then
+            flags+=" -fprofile-generate -fprofile-update=atomic"
+            rtdir=$(cygpath -m "$LLVM_ROOT/lib/clang/22/lib/windows")
+            linkflags="/LIBPATH:$rtdir"
+            ls -l "$rtdir" | grep -i profile || echo "NO clang_rt.profile in $rtdir"
+          fi
           if [ -n '${{ matrix.profile }}' ]; then
             flags+=" -fprofile-use=$(cygpath -m "$PWD/${{ matrix.profile }}")"
             flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
@@ -325,6 +311,8 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
             "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
             "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_EXE_LINKER_FLAGS=$linkflags" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=$linkflags" \
             "-DCMAKE_C_FLAGS=$flags" \
             "-DCMAKE_CXX_FLAGS=-EHsc $flags"
 
