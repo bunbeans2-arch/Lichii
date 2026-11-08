@@ -60,8 +60,9 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
-    fast_maxwell3d = !record_write_history &&
-                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+    fast_maxwell3d = !record_write_history && !g_trace_first_method_writes &&
+                     (!VideoCommon::Nx2Profile::Enabled() ||
+                      VideoCommon::Nx2Profile::FastMethods());
 }
 
 Maxwell3D::~Maxwell3D() = default;
