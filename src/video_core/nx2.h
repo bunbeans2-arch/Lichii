@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -135,6 +136,18 @@ inline void Nx2ClearGpuWrittenPages() {
         return false;
     }
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+}
+
+/// EDEN_NX2_NARROW_DRAINS=0 turns off the split front's narrow waits (semaphore acquires met
+/// from memory or the channel's own queued release, waits up to the last overlapping write, and
+/// precise macro DMA reads) and goes back to full drains of the back thread, as before them. On
+/// by default. Read once.
+[[nodiscard]] inline bool Nx2NarrowDrains() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_NARROW_DRAINS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 
 /// False only when no page of [device_address, device_address + size) has been GPU-written.

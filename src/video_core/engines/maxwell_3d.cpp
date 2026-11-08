@@ -1578,7 +1578,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // second; a full drain each time kept the two GPU threads waiting on each other. Every 4096th
     // read still drains and checks for GPU-written data, which turns the precise reads off.
     static bool precise_disabled{};
-    const bool precise = !precise_disabled &&
+    const bool precise = !precise_disabled && Tegra::Nx2NarrowDrains() &&
                          !VideoCommon::QueryDma::TraceEnabled() &&
                          !Tegra::Nx2CmdPageDiag::g_enabled &&
                          fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] == 0 &&
@@ -1718,7 +1718,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             LOG_INFO(HW_GPU, "MME DMA reads: {} of {} flushed pending reports", flushes, reads);
         }
     }
-    if (reads_reports) {
+    // EDEN_NX2_NARROW_DRAINS=0: every read writes out pending reports, as before the counters.
+    if (reads_reports || !Tegra::Nx2NarrowDrains()) {
         split.Run(
             [this, source, read_bytes] {
                 VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);

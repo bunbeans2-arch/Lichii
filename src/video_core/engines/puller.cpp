@@ -355,7 +355,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // it. Skip draining the back for it (~8% of the front in Ocarina of Time); later command
         // fetches still wait for the work before it (NoteSync).
         auto& split = VideoCommon::GpuSplit::Get();
-        if (op == GpuSemaphoreOperation::AcquireGequal && split.Active() &&
+        // EDEN_NX2_NARROW_DRAINS=0: none of the three shortcuts below, the full drain as before.
+        const bool narrow = Tegra::Nx2NarrowDrains();
+        if (narrow && op == GpuSemaphoreOperation::AcquireGequal && split.Active() &&
             StableSemaphore(dma_pusher, acquire.address) &&
             acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
             if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Fast);
@@ -364,13 +366,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         // This channel's own release, still queued, meets it once the back runs it, which is
         // before anything sent after the acquire.
-        if (const auto released = OwnQueuedRelease(dma_pusher, acquire.address);
+        if (const auto released =
+                narrow ? OwnQueuedRelease(dma_pusher, acquire.address) : std::nullopt;
             released && acquire.Matches(*released)) {
             if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Own);
             split.NoteSync();
             return;
         }
-        if (split.Active()) {
+        if (narrow && split.Active()) {
             // Only queued work that writes the semaphore (or untracked writes) can change it.
             const u64 target = split.ReadReadyPosition(&dma_pusher.memory_manager, acquire.address,
                                                        acquire.address + 4);
@@ -508,7 +511,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     auto& split = VideoCommon::GpuSplit::Get();
-    if (operation <= 3 && operation != 1) {
+    // EDEN_NX2_NARROW_DRAINS=0: no shortcuts, the drain below as before.
+    const bool narrow = Tegra::Nx2NarrowDrains();
+    if (narrow && operation <= 3 && operation != 1) {
         // This channel's own queued release meets it before anything sent after the acquire.
         if (const auto released = OwnQueuedRelease(dma_pusher, address)) {
             if (operation == 0 ? *released == payload
@@ -519,7 +524,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             }
         }
     }
-    if ((operation == 2 || operation == 3) && split.Active() && StableSemaphore(dma_pusher, address)) {
+    if (narrow && (operation == 2 || operation == 3) && split.Active() &&
+        StableSemaphore(dma_pusher, address)) {
         // A greater-or-equal value already in memory with no queued write to it: skip the drain.
         const u32 current = dma_pusher.memory_manager.Read<u32>(address);
         if (operation == 2 ? current >= payload : static_cast<s32>(current - payload) >= 0) {
