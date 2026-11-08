@@ -25,6 +25,7 @@
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_writer_diag.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/puller.h"
@@ -111,6 +112,11 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if (operation != 0 && operation != 2) {
         LOG_WARNING(HW_GPU, "Native compute report semaphore operation {} not supported", operation);
         return;
+    }
+    if (VideoCommon::Nx2WriterDiag::Enabled()) {
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            VideoCommon::Nx2WriterDiag::NoteComputeRelease(static_cast<u64>(*device));
+        }
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
@@ -368,6 +374,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                if (VideoCommon::Nx2WriterDiag::Enabled()) {
+                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        VideoCommon::Nx2WriterDiag::NoteComputeRelease(static_cast<u64>(*device));
+                    }
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,

@@ -24,6 +24,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_writer_diag.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -408,10 +409,37 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                              causes[3], causes[4]);
                 }
             }
+            // EDEN_NX2_WRITER_DIAG: is this wait for queued compute/copy work (the writer position,
+            // which has no address) needed? Diagnostic only.
+            namespace WriterDiag = VideoCommon::Nx2WriterDiag;
+            const bool writer_diag = WriterDiag::Enabled() && target > split.Consumed() &&
+                                     target == split.WriterPosition();
+            const u32 writer_source = writer_diag ? split.WriterSource() : 0;
+            const bool met_before =
+                writer_diag && acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
             const auto wait_start = std::chrono::steady_clock::now();
             split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
             if (auto* stats = AcquireStats::Get()) stats->wait_ns += NsSince(wait_start);
-            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            const bool met_after =
+                acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
+            if (writer_diag) {
+                const u32 engine = writer_source >> 12;
+                const auto writer_engine =
+                    engine == static_cast<u32>(EngineTypes::KeplerCompute) ? WriterDiag::WriterEngine::Compute
+                    : engine == static_cast<u32>(EngineTypes::MaxwellDMA)  ? WriterDiag::WriterEngine::Dma
+                                                                           : WriterDiag::WriterEngine::Other;
+                const auto outcome = met_before && met_after ? WriterDiag::WaitOutcome::MetBefore
+                                     : met_before ? WriterDiag::WaitOutcome::MetBeforeLost
+                                     : met_after  ? WriterDiag::WaitOutcome::MetAfter
+                                                  : WriterDiag::WaitOutcome::Unmet;
+                const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+                const bool at_compute_release =
+                    outcome == WriterDiag::WaitOutcome::Unmet && device &&
+                    WriterDiag::IsRecentComputeRelease(static_cast<u64>(*device));
+                WriterDiag::NoteAcquireWriterWait(writer_engine, writer_source, outcome,
+                                                  NsSince(wait_start), at_compute_release);
+            }
+            if (met_after) {
                 if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterWait);
                 split.NoteSync();
                 return;
