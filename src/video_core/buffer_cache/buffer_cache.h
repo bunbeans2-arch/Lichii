@@ -1465,68 +1465,81 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         !memory_tracker.IsRegionGpuModified(device_addr, size)) {
-        // The bank size is only an upper limit: stop at the end of the mapped memory.
-        u64 mapped_size = 0;
-        while (mapped_size < size &&
-               device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
-            mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
-        }
-        const u64 check_size = (std::min<u64>)(mapped_size, size);
-        // Banks slide through larger buffers, a new address per draw: compare each page with
-        // its last contents and mark only the pages that changed.
-        if (native_indirect_page_snapshots.size() >= 16384) {
-            native_indirect_page_snapshots.clear();
-        }
-        const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-        const DAddr end = device_addr + check_size;
-        // A page compared since the last point the guest could change it unseen (a submission,
-        // an acquire, an inline upload) is still the same: ~16% of the GPU back thread in
-        // Ocarina was these compares. EDEN_NX2_BANK_EPOCH=0 compares on every bind.
-        static const bool use_epoch = [] {
-            const char* value = std::getenv("EDEN_NX2_BANK_EPOCH");
-            return value == nullptr || value[0] != '0';
+        // LICHII_BANK_PAGE_MEMO=0 (or EDEN_NX2_BANK_EPOCH=0, or the EDEN_NX2_MME_DMA_STATS
+        // counts) walks every page as before.
+        static const bool use_page_memo = [] {
+            const char* value = std::getenv("LICHII_BANK_PAGE_MEMO");
+            const char* epoch_value = std::getenv("EDEN_NX2_BANK_EPOCH");
+            return (value == nullptr || value[0] != '0') &&
+                   (epoch_value == nullptr || epoch_value[0] != '0') &&
+                   std::getenv("EDEN_NX2_MME_DMA_STATS") == nullptr;
         }();
-        const u64 epoch = Tegra::g_nx2_guest_sync_epoch.load(std::memory_order_acquire);
-        for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
-            const u8* const guest = device_memory.template GetPointer<u8>(page);
-            if (guest == nullptr) {
-                continue;
+        if (use_page_memo) [[likely]] {
+            CheckNativeBankPagesMemo(device_addr, size);
+        } else {
+            // The bank size is only an upper limit: stop at the end of the mapped memory.
+            u64 mapped_size = 0;
+            while (mapped_size < size &&
+                   device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+                mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
             }
-            auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-            if (!inserted && use_epoch && it->second.epoch == epoch) {
-                continue;
+            const u64 check_size = (std::min<u64>)(mapped_size, size);
+            // Banks slide through larger buffers, a new address per draw: compare each page with
+            // its last contents and mark only the pages that changed.
+            if (native_indirect_page_snapshots.size() >= 16384) {
+                native_indirect_page_snapshots.clear();
             }
-            it->second.epoch = epoch;
-            const bool same =
-                !inserted && std::memcmp(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
-            // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
-            if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
-                stats) {
-                static std::array<u64, 3> counts{};
-                static std::array<u64, 4> changed_state{};
-                ++counts[same ? 0 : (inserted ? 1 : 2)];
-                if (!same && !inserted) {
-                    // Did the tracker already know (CPU-modified), or was the page clean, and
-                    // was it GPU-modified?
-                    const bool known =
-                        memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE);
-                    const bool gpu =
-                        memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE);
-                    ++changed_state[(known ? 1 : 0) | (gpu ? 2 : 0)];
+            const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+            const DAddr end = device_addr + check_size;
+            // A page compared since the last point the guest could change it unseen (a submission,
+            // an acquire, an inline upload) is still the same: ~16% of the GPU back thread in
+            // Ocarina was these compares. EDEN_NX2_BANK_EPOCH=0 compares on every bind.
+            static const bool use_epoch = [] {
+                const char* value = std::getenv("EDEN_NX2_BANK_EPOCH");
+                return value == nullptr || value[0] != '0';
+            }();
+            const u64 epoch = Tegra::g_nx2_guest_sync_epoch.load(std::memory_order_acquire);
+            for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+                const u8* const guest = device_memory.template GetPointer<u8>(page);
+                if (guest == nullptr) {
+                    continue;
                 }
-                if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
-                    LOG_INFO(HW_GPU,
-                             "Native bank pages checked: same {}, new {}, changed {} (tracker "
-                             "clean {}, CPU-modified {}, GPU {}, both {})",
-                             counts[0], counts[1], counts[2], changed_state[0],
-                             changed_state[1], changed_state[2], changed_state[3]);
+                auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+                if (!inserted && use_epoch && it->second.epoch == epoch) {
+                    continue;
                 }
+                it->second.epoch = epoch;
+                const bool same =
+                    !inserted && std::memcmp(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+                // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
+                if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+                    stats) {
+                    static std::array<u64, 3> counts{};
+                    static std::array<u64, 4> changed_state{};
+                    ++counts[same ? 0 : (inserted ? 1 : 2)];
+                    if (!same && !inserted) {
+                        // Did the tracker already know (CPU-modified), or was the page clean, and
+                        // was it GPU-modified?
+                        const bool known =
+                            memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE);
+                        const bool gpu =
+                            memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE);
+                        ++changed_state[(known ? 1 : 0) | (gpu ? 2 : 0)];
+                    }
+                    if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
+                        LOG_INFO(HW_GPU,
+                                 "Native bank pages checked: same {}, new {}, changed {} (tracker "
+                                 "clean {}, CPU-modified {}, GPU {}, both {})",
+                                 counts[0], counts[1], counts[2], changed_state[0],
+                                 changed_state[1], changed_state[2], changed_state[3]);
+                    }
+                }
+                if (same) {
+                    continue;
+                }
+                std::memcpy(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE);
+                memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
             }
-            if (same) {
-                continue;
-            }
-            std::memcpy(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE);
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
@@ -1597,6 +1610,53 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         runtime.BindUniformBuffer(buffer, offset, size);
     }
     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+}
+
+template <class P>
+void BufferCache<P>::CheckNativeBankPagesMemo(DAddr device_addr, u32 size) {
+    // The walk of BindHostGraphicsUniformBuffer with the epoch skip, minus the lookups of pages
+    // it would skip. Same clear at the same binds, so the snapshot map holds the same pages.
+    if (native_indirect_page_snapshots.size() >= 16384) {
+        native_indirect_page_snapshots.clear();
+        ++native_snapshot_clears;
+    }
+    const u64 epoch = Tegra::g_nx2_guest_sync_epoch.load(std::memory_order_acquire);
+    // Read before the walk: a Map or Unmap during it changes the token for the next bind.
+    const u64 translation = device_memory.TranslationGeneration();
+    if (epoch != bank_page_memo_epoch || translation != bank_page_memo_translation ||
+        native_snapshot_clears != bank_page_memo_clears) {
+        bank_page_memo_epoch = epoch;
+        bank_page_memo_translation = translation;
+        bank_page_memo_clears = native_snapshot_clears;
+        ++bank_page_memo_token;
+    }
+    const u64 token = bank_page_memo_token;
+    const DAddr end = device_addr + size;
+    for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE); page < end;
+         page += Core::DEVICE_PAGESIZE) {
+        BankPageMemo& memo =
+            bank_page_memo[(page >> Core::DEVICE_PAGEBITS) % bank_page_memo.size()];
+        if (memo.page == page && memo.token == token) {
+            // Mapped under this translation, and stamped with this epoch since the last clear.
+            continue;
+        }
+        const u8* const guest = device_memory.template GetPointer<u8>(page);
+        if (guest == nullptr) {
+            // The bank size is only an upper limit: stop at the end of the mapped memory.
+            break;
+        }
+        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+        if (inserted || it->second.epoch != epoch) {
+            it->second.epoch = epoch;
+            const bool same =
+                !inserted && std::memcmp(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+            if (!same) {
+                std::memcpy(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE);
+                memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            }
+        }
+        memo = BankPageMemo{.page = page, .token = token};
+    }
 }
 
 template <class P>

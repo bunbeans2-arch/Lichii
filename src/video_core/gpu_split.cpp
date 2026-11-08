@@ -527,6 +527,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
+        // EDEN_NX2_PROFILE_FAST: the fast method path has no zones of its own. One exclusive
+        // zone around the batch counts what the zones inside it (draws, fences, ...) don't.
+        std::optional<Nx2Profile::Scope> batch_scope;
+        if (Nx2Profile::FastMethods()) {
+            batch_scope.emplace(Nx2Profile::Zone::Method);
+        }
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size =
@@ -547,6 +553,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 NotifyFront();
             }
         }
+        batch_scope.reset();
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }
