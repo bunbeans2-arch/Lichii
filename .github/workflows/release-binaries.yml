@@ -353,7 +353,7 @@ jobs:
             -DENABLE_WERROR=OFF \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+            "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -ldwmapi" \
             "-DCMAKE_C_FLAGS=$profile" \
             "-DCMAKE_CXX_FLAGS=$profile"
 
