@@ -4188,6 +4188,12 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
+    // A fast (delta) draw skips PrepareImageView and so SynchronizeAliases: after a write to an
+    // image with aliases, resolve the next draw in full so a sampled alias gets the new contents
+    // (H17 review; the same gap exists upstream in #858, and VERIFY compares ids only).
+    if (!image.aliased_images.empty()) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+    }
 }
 
 template <class P>
