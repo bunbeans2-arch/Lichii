@@ -127,6 +127,58 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    // EDEN_NX2_ACQ_POLL_STABLE=1 (H14 v4, opt-in): a suspended channel waits on a semaphore the
+    // CPU (or another channel) releases, and this poll runs ~1000 times a second. Most polls skip
+    // the full drain (it waits for everything queued and has the back submit):
+    // - stable (StableSemaphore: nothing queued can write the word, page not GPU-written): guest
+    //   memory holds its value. Met: resume. Not met: keep waiting.
+    // - not stable (queued compute/copy or a write to it): read guest memory anyway. Met: the old
+    //   path below confirms it (a queued write may still lower it). Not met: keep waiting, but take
+    //   the old path at least every millisecond (backstop), so a release is never missed for long.
+    // Latched by a GPU release, GPU-written page, delayed fences: the old path, as before.
+    static const bool poll_stable = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQ_POLL_STABLE");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool fences_delayed = Settings::IsGPUFenceBehaviorDefault()
+                                    ? Settings::IsGPULevelHigh()
+                                    : Settings::IsGPUFenceBehaviorBalanced() ||
+                                          Settings::IsGPUFenceBehaviorAccurate();
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        poll_stable && !fences_delayed && split.Active()) {
+        const GPUVAddr sem = pending_acquire->address;
+        const auto sem_device = dma_pusher.memory_manager.GpuToCpuAddress(sem);
+        // StableSemaphore (it loads Consumed) BEFORE Latched: the back can latch a release and
+        // store `consumed` between the two reads.
+        const bool stable =
+            sem_device && !Nx2IsGpuWritten(*sem_device) && StableSemaphore(dma_pusher, sem);
+        const bool latched = Nx2SemaphoreWaiters::Get().Latched(this);
+        const bool gpu_written = !sem_device || Nx2IsGpuWritten(*sem_device);
+        const auto now = std::chrono::steady_clock::now();
+        // Past 2 s, take the old path once so it logs the wait.
+        const bool log_once = !pending_acquire->reported &&
+                              now - pending_acquire->since > std::chrono::seconds{2};
+        if (!latched && !gpu_written && !log_once) {
+            const bool met = pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(sem));
+            if (stable && met) {
+                // As the acquire's fast path: later fetches still wait for the work before it.
+                split.NoteSync();
+                return true;
+            }
+            // `last_fences` is only read with delayed fences (excluded here): it times the
+            // backstop.
+            const bool backstop =
+                !stable && now - pending_acquire->last_fences >= std::chrono::milliseconds{1};
+            if (!met && !backstop) {
+                // Let the back run what the front committed (a release among it) and poll again.
+                split.Publish();
+                return false;
+            }
+            if (backstop) {
+                pending_acquire->last_fences = now;
+            }
+        }
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
@@ -452,6 +504,33 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (met_after) {
                 if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::AfterWait);
                 split.NoteSync();
+                return;
+            }
+            // EDEN_NX2_ACQ_SUSPEND_NODRAIN=1 (H14 v4, opt-in): the back has run every queued write
+            // that can reach the word (the wait above) and it is still not met, so the CPU or
+            // another channel releases it later. Suspend now instead of draining the back fully
+            // (~385 us each, ~99 ms/s in OoT: n1-mmestats_20261108-1230.log). The fences are
+            // released on the back in order without waiting: the forced ReleaseFences signals a
+            // fence and submits the deferred work itself (WaitPendingFences -> SubmitDeferredWork).
+            // A release among them latches the waiter registered first; the poll finds it.
+            static const bool suspend_nodrain = [] {
+                const char* value = std::getenv("EDEN_NX2_ACQ_SUSPEND_NODRAIN");
+                return value != nullptr && value[0] == '1';
+            }();
+            const bool fences_delayed = Settings::IsGPUFenceBehaviorDefault()
+                                            ? Settings::IsGPULevelHigh()
+                                            : Settings::IsGPUFenceBehaviorBalanced() ||
+                                                  Settings::IsGPUFenceBehaviorAccurate();
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+                suspend_nodrain && !fences_delayed && device && !Nx2IsGpuWritten(*device)) {
+                Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+                OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+                split.Publish();
+                pending_acquire = acquire;
+                pending_acquire->since = std::chrono::steady_clock::now();
+                if (auto* stats = AcquireStats::Get()) stats->Note(AcquireStats::Suspended);
+                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
                 return;
             }
         }
