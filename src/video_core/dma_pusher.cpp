@@ -229,10 +229,29 @@ bool DmaPusher::Step() {
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         // Recheck even when the wait returns at once: a writer may have finished (and marked the
         // pages) since the check above.
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+        // LICHII_LIST_WRITER_WAIT=0 (experiment): until a GPU-written entry has been seen, don't
+        // wait for queued compute and copy work that might still write this entry. Ocarina waits
+        // here ~5,800 times a second (~350 ms/s) and showed no GPU-written entry in r22; the
+        // first one it would read before its writer ran, then the waits return.
+        static const bool skip_list_wait = [] {
+            const char* const value = std::getenv("LICHII_LIST_WRITER_WAIT");
+            return value != nullptr && value[0] == '0';
+        }();
+        static std::atomic<bool> seen_gpu_written{};
+        if (gpu_written && skip_list_wait &&
+            !seen_gpu_written.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(HW_GPU, "GPU-written command list entry at {:#x}: waiting for its writers "
+                                "again (LICHII_LIST_WRITER_WAIT=0)",
+                        u64{dma_state.dma_get});
+        }
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            (!skip_list_wait || seen_gpu_written.load(std::memory_order_relaxed))) {
             VideoCommon::GpuSplit::Get().WaitForWriters();
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            if (gpu_written && skip_list_wait) {
+                seen_gpu_written.store(true, std::memory_order_relaxed);
+            }
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
