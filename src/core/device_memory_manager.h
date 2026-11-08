@@ -142,6 +142,12 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
+    /// Bumped by Map and Unmap: a GetPointer result seen under one value holds while it is
+    /// current (LICHII_BANK_PAGE_MEMO in the buffer cache relies on it).
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
 private:
     struct TranslationEntry {
         DAddr guest_page{};
