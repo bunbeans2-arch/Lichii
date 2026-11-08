@@ -182,6 +182,8 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     }
     if (pending_acquire) {
         Nx2BumpGuestSyncEpoch();
+        // Suspended: the CPU may have written after the acquire's own break. Break again, in order.
+        OnBack([] { VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence); });
     }
     // Only a resume from a suspension counts: DmaPusher::Step calls this before every entry, and
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
@@ -346,6 +348,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         NoteRelease(sequence_address, payload);
     } else if (g_nx2_ampere) {
         Nx2BumpGuestSyncEpoch();
+        // The CPU may rewrite what the next draws read (texture handles) before the release this
+        // waits for. The Fast and Own exits below neither drain nor break: end fast draw reuse in
+        // stream order, before the draws sent after this acquire (a front-side Break could reach
+        // the back before draws sent earlier and let a later draw reuse a pre-acquire resolve).
+        OnBack([] { VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence); });
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
         // met instead of reading ahead (approach from changes.patch).
