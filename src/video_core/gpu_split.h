@@ -272,6 +272,8 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    /// Back spins (Pause, ~30 ns each on Skylake-class cores) before it flags back_starved.
+    static constexpr u32 StarvedSpins = 64;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -290,7 +292,11 @@ private:
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
         write_position += words;
-        if (write_position - published_local >= publish_every) {
+        // A starved back (it ran out of published work, usually right after a front wait) gets
+        // this entry at once instead of after up to publish_every more words (~20 us of front
+        // work). Every commit is already a valid publish point (the threshold can land on any).
+        if (write_position - published_local >= publish_every ||
+            (demand_publish && back_starved.load(std::memory_order_relaxed))) {
             Publish();
         }
     }
@@ -358,6 +364,8 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// LICHII_SPLIT_DEMAND_PUBLISH=0 turns off the back_starved check in Commit.
+    bool demand_publish{true};
 
     // Back side. Own cache line: read for every entry, away from publish_every/front_engine.
     alignas(64) Tegra::Engines::EngineInterface* back_engine{};
@@ -384,6 +392,9 @@ private:
     alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
+    /// The back has nothing published left to run (set entering SplitWait, cleared before it
+    /// runs entries). A hint only: a missed or stale value costs one early or late publish.
+    alignas(128) std::atomic<bool> back_starved{};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     /// The front sleeps in Backoff (#161: instead of yielding).

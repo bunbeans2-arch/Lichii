@@ -115,7 +115,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
-    ring = std::make_unique<u64[]>(RingWords);
+    {
+        const char* demand = std::getenv("LICHII_SPLIT_DEMAND_PUBLISH");
+        demand_publish = demand == nullptr || demand[0] != '0';
+    }
+    ring =std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -207,6 +211,7 @@ void GpuSplit::Stop() {
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
+    back_starved.store(false, std::memory_order_relaxed);
 }
 
 u64* GpuSplit::ReserveSlow(size_t words) {
@@ -494,6 +499,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
+                if (spins == StarvedSpins) {
+                    // Still empty after ~2 us: ask the front to publish its next entry at once
+                    // (Commit) rather than after a full batch. Not sooner, so a back that keeps
+                    // up with the front doesn't get one publish (a cache line trip) per entry.
+                    back_starved.store(true, std::memory_order_relaxed);
+                }
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
@@ -525,6 +536,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        if (back_starved.load(std::memory_order_relaxed)) {
+            back_starved.store(false, std::memory_order_relaxed);
+        }
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         // EDEN_NX2_PROFILE_FAST: the fast method path has no zones of its own. One exclusive
