@@ -33,6 +33,21 @@
 
 namespace VideoCommon {
 
+/// LICHII_FAKE_OCCLUSION=<samples>: occlusion reports are written at once with that many samples
+/// passed and no host occlusion query runs. Ocarina of Time reports ~1,400 a frame and reads them
+/// back on the CPU; on AMD the queries, their copies and the read stalls cost most of the frame.
+inline u32 FakeOcclusionSamples() {
+    static const u32 samples = [] {
+        const char* const value = std::getenv("LICHII_FAKE_OCCLUSION");
+        const u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        if (parsed != 0) {
+            LOG_INFO(HW_GPU, "LICHII_FAKE_OCCLUSION: occlusion reports read {} samples", parsed);
+        }
+        return parsed;
+    }();
+    return samples;
+}
+
 using Maxwell = Tegra::Engines::Maxwell3D;
 
 struct SyncValuesStruct {
@@ -190,6 +205,9 @@ QueryCacheBase<Traits>::~QueryCacheBase() = default;
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterEnable(QueryType counter_type, bool is_enabled) {
+    if (counter_type == QueryType::ZPassPixelCount64 && FakeOcclusionSamples() != 0) {
+        return;
+    }
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
@@ -216,6 +234,9 @@ void QueryCacheBase<Traits>::CounterClose(QueryType counter_type) {
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReset(QueryType counter_type) {
+    if (counter_type == QueryType::ZPassPixelCount64 && FakeOcclusionSamples() != 0) {
+        return;
+    }
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
@@ -246,6 +267,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         LOG_INFO(HW_GPU, "nx2 report addr={:#x} type={} flags={:#x} payload={:#x} as={} device={:#x}", addr,
                  static_cast<u32>(counter_type), static_cast<u32>(flags), payload, gpu_memory->GetID(),
                  gpu_memory->GpuToCpuAddress(addr).value_or(0));
+    }
+    if (counter_type == QueryType::ZPassPixelCount64 && !is_fence && FakeOcclusionSamples() != 0) {
+        // Written like a payload: at once with GPU accuracy below High.
+        counter_type = QueryType::Payload;
+        payload = FakeOcclusionSamples();
     }
     size_t streamer_id = static_cast<size_t>(counter_type);
     auto* streamer = impl->streamers[streamer_id];
