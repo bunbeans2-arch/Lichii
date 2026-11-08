@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -226,16 +227,27 @@ public:
             NoteMemoryBarrier(0x40001);
             return;
         }
-        if (write_blocks.size() >= 8192 && Consumed() >= latest_block_write) {
+        const size_t tracked = write_blocks.size() + small_blocks.size();
+        if (tracked >= 8192 && Consumed() >= latest_block_write) {
             write_blocks.clear();
             opaque_blocks.clear();
+            small_blocks.clear();
         }
-        if (write_blocks.size() >= 65536) {
+        if (tracked >= 65536) {
             write_blocks.clear();
             opaque_blocks.clear();
+            small_blocks.clear();
             NoteMemoryBarrier(0x40000);
         }
-        NoteBlocks(write_blocks, space, begin, end);
+        // EDEN_NX2_FINE_SMALL_WRITES=1: a write of up to 16 bytes (a report, a semaphore release,
+        // a few constant buffer words) is kept in 16-byte blocks, so a read of the words next to
+        // it in the same 64 bytes doesn't wait for it. Each write is in exactly one of the maps,
+        // in blocks that cover all its bytes; reads take the latest of both.
+        if (fine_small_writes && end - begin <= SmallWriteBytes) {
+            NoteSmallBlocks(space, begin, end);
+        } else {
+            NoteBlocks(write_blocks, space, begin, end);
+        }
         latest_block_write = write_position;
         if (opaque) {
             NoteBlocks(opaque_blocks, space, begin, end);
@@ -245,7 +257,11 @@ public:
     /// The position the back must reach before [begin, end) of `space` can be read: the last
     /// untracked write, or the last queued write that overlaps it.
     [[nodiscard]] u64 ReadReadyPosition(const void* space, u64 begin, u64 end) {
-        return ReadyPosition(write_blocks, latest_block_write, space, begin, end);
+        const u64 target = ReadyPosition(write_blocks, latest_block_write, space, begin, end);
+        if (small_blocks.empty() || latest_block_write <= target || end <= begin) {
+            return target;
+        }
+        return std::max(target, SmallBlocksPosition(space, begin, end));
     }
     /// As ReadReadyPosition, for writes whose data the front does not know.
     [[nodiscard]] u64 OpaqueReadyPosition(const void* space, u64 begin, u64 end) {
@@ -340,6 +356,16 @@ private:
     static constexpr u64 MaxWriteBlocks = 1024;
     std::unordered_map<u64, u64> write_blocks;
     std::unordered_map<u64, u64> opaque_blocks;
+    // EDEN_NX2_FINE_SMALL_WRITES: tracked writes of up to 16 bytes, in 16-byte blocks.
+    static constexpr u64 SmallBlockShift = 4;
+    static constexpr u64 SmallWriteBytes = 16;
+    static inline const bool fine_small_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_FINE_SMALL_WRITES");
+        return value != nullptr && value[0] == '1';
+    }();
+    std::unordered_map<u64, u64> small_blocks;
+    void NoteSmallBlocks(const void* space, u64 begin, u64 end);
+    u64 SmallBlocksPosition(const void* space, u64 begin, u64 end) const;
     u64 latest_block_write{};
     u64 latest_opaque_write{};
     // Keyed by the backing memory (`space` is a Tegra::MemoryManager), so writes and reads

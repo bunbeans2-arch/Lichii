@@ -169,14 +169,34 @@ u64 GpuSplit::BlocksPosition(const std::unordered_map<u64, u64>& blocks, const v
     return position;
 }
 
+void GpuSplit::NoteSmallBlocks(const void* space, u64 begin, u64 end) {
+    ForEachBlockKey(space, begin, end, SmallBlockShift,
+                    [&](u64 key) { small_blocks[key] = write_position; });
+}
+
+u64 GpuSplit::SmallBlocksPosition(const void* space, u64 begin, u64 end) const {
+    u64 position = 0;
+    ForEachBlockKey(space, begin, end, SmallBlockShift, [&](u64 key) {
+        if (const auto it = small_blocks.find(key); it != small_blocks.end()) {
+            position = std::max(position, it->second);
+        }
+    });
+    return position;
+}
+
 u64 GpuSplit::TrackedWritePosition(const void* space, u64 begin, u64 end) {
-    if (end <= begin || write_blocks.empty() || latest_block_write <= Consumed()) {
+    if (end <= begin || (write_blocks.empty() && small_blocks.empty()) ||
+        latest_block_write <= Consumed()) {
         return 0;
     }
     if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
         return latest_block_write;
     }
-    return BlocksPosition(write_blocks, space, begin, end);
+    u64 position = BlocksPosition(write_blocks, space, begin, end);
+    if (!small_blocks.empty()) {
+        position = std::max(position, SmallBlocksPosition(space, begin, end));
+    }
+    return position;
 }
 
 void GpuSplit::Stop() {
@@ -198,6 +218,7 @@ void GpuSplit::Stop() {
     last_barrier_position = 0;
     write_blocks.clear();
     opaque_blocks.clear();
+    small_blocks.clear();
     latest_block_write = 0;
     latest_opaque_write = 0;
     last_sync_position = 0;
