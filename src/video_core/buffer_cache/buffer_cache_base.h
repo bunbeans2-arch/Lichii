@@ -466,7 +466,12 @@ public:
     /// The guest words of each page of native programs' indirectly read banks when last checked:
     /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
     /// per page).
-    std::unordered_map<DAddr, std::array<u8, Core::DEVICE_PAGESIZE>> native_indirect_page_snapshots;
+    struct NativePageSnapshot {
+        std::array<u8, Core::DEVICE_PAGESIZE> bytes;
+        /// Tegra::g_nx2_guest_sync_epoch when compared last: unchanged since if still current.
+        u64 epoch{};
+    };
+    std::unordered_map<DAddr, NativePageSnapshot> native_indirect_page_snapshots;
 
 private:
     template <typename Mask, typename Func>

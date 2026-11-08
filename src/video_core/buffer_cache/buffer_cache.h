@@ -1434,14 +1434,27 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = device_addr + check_size;
+        // EDEN_NX2_BANK_EPOCH=1 (opt-in here; default on in conongnang's b146a43c): a page
+        // compared since the last point the guest could change it unseen (a submission, an
+        // acquire, an inline upload) is still the same, so it is not compared again. Those
+        // compares were ~16% of the GPU back thread in Ocarina (his RX 9070 XT measurement).
+        static const bool use_epoch = [] {
+            const char* value = std::getenv("EDEN_NX2_BANK_EPOCH");
+            return value != nullptr && value[0] != 0 && value[0] != '0';
+        }();
+        const u64 epoch = Tegra::g_nx2_guest_sync_epoch.load(std::memory_order_acquire);
         for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
             const u8* const guest = device_memory.template GetPointer<u8>(page);
             if (guest == nullptr) {
                 continue;
             }
             auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+            if (!inserted && use_epoch && it->second.epoch == epoch) {
+                continue;
+            }
+            it->second.epoch = epoch;
             const bool same =
-                !inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+                !inserted && std::memcmp(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
             // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
             if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
                 stats) {
@@ -1468,7 +1481,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (same) {
                 continue;
             }
-            std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
+            std::memcpy(it->second.bytes.data(), guest, Core::DEVICE_PAGESIZE);
             memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
         }
     }

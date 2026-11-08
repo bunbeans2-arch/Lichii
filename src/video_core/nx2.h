@@ -24,6 +24,16 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// Counts the points at which guest memory a later draw reads may have changed without the memory
+// tracker seeing it: the guest submitting command lists, semaphore acquires the GPU passes, and
+// inline-to-memory uploads. Checks of such memory need repeating only when it moved
+// (BufferCache::BindHostGraphicsUniformBuffer, EDEN_NX2_BANK_EPOCH). From conongnang b146a43c.
+inline std::atomic<u64> g_nx2_guest_sync_epoch{1};
+
+inline void Nx2BumpGuestSyncEpoch() {
+    g_nx2_guest_sync_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 // GPU VA that nx2:gpu GetVaRange and GetUserPartition report to NVN. The in-process
 // allocator hands out addresses in [Nx2GpuVaStart, Nx2GpuVaEnd). NvRm's AllocAsEx range
 // can be smaller; the GMMU page tables still have to cover this one.
