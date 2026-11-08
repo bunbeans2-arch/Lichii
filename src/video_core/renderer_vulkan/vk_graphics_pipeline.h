@@ -386,14 +386,6 @@ private:
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
 
-public:
-    /// Whether a stage writes storage buffers or images (its draws change memory).
-    [[nodiscard]] bool WritesStorage() const noexcept {
-        return writes_storage;
-    }
-
-private:
-
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
     vk::PipelineLayout pipeline_layout;
