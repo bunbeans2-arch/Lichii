@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -61,7 +62,23 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     size_t state_offset = 0;
     size_t state_size = 0;
+    /// Applied only while this returns true (an env kill switch); null means always.
+    bool (*env_enabled)() = nullptr;
 };
+
+// EDEN_NX2_<NAME>: unset or empty gives the default, otherwise on unless it starts with '0'.
+bool OotEnvSwitch(const char* name, bool default_on) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == 0) {
+        return default_on;
+    }
+    return value[0] != '0';
+}
+
+bool OotOcclusionOffEnabled() {
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_OCCLUSION_OFF", true);
+    return enabled;
+}
 
 constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
 constexpr std::array<u8, 4> MAX_RESOLUTION_BRANCH{0x0F, 0x02, 0x00, 0x14};
@@ -88,6 +105,24 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
 };
 
+// The render pipeline's settings are mirrored into nodes (main+0x11ac..., per setting: init, then
+// compare and store when it changes) after `bl getter; ldrb w8, [x0]`. `mov w8, wzr` there makes
+// the setting false. Module offsets: the community IPS files' offsets are these + 0x100.
+constexpr std::array<u8, 4> OOT_LDRB_W8_X0{0x08, 0x00, 0x40, 0x39};
+constexpr std::array<u8, 4> OOT_MOV_W8_WZR{0xE8, 0x03, 0x1F, 0x2A};
+
+// cLohan's OcclusionOff_ZPrePassAndSamplesQuery: CreateZPrePassOcclusionQuery (getter
+// main+0xf5acc0) and CreateSamplesPassedQuery (main+0xf5bf70) off, so the game stops issuing the
+// per-object occlusion queries and the conditional renders (macro 0xe2c) they feed.
+constexpr std::array OOT_OCCLUSION_OFF_RECORDS{
+    BuiltinPatchRecord{0x11ACE68, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+    BuiltinPatchRecord{0x11B828C, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+    BuiltinPatchRecord{0x11B82A4, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+    BuiltinPatchRecord{0x11ACEC8, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+    BuiltinPatchRecord{0x11B82DC, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+    BuiltinPatchRecord{0x11B82F4, OOT_MOV_W8_WZR, OOT_LDRB_W8_X0},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -106,6 +141,14 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+    },
+    BuiltinPatch{
+        .name = "Occlusion Off (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_OCCLUSION_OFF_RECORDS,
+        .env_enabled = OotOcclusionOffEnabled,
     },
 };
 
@@ -531,6 +574,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+            continue;
+        }
+        if (patch.env_enabled != nullptr && !patch.env_enabled()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": off by its EDEN_NX2_ switch", patch.name);
             continue;
         }
         if (patch.build_id != build_id) {
