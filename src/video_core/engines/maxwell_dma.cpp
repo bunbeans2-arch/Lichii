@@ -15,6 +15,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_writer_diag.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -380,6 +381,12 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    if (type != LaunchDMA::SemaphoreType::NONE && VideoCommon::Nx2WriterDiag::Enabled()) {
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            VideoCommon::Nx2WriterDiag::NoteRelease(VideoCommon::Nx2WriterDiag::ReleaseKind::Dma,
+                                                    static_cast<u64>(*device));
+        }
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

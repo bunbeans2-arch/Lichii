@@ -172,8 +172,13 @@ public:
     void Drain(DrainSite site = DrainSite::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter() {
+    /// `source` (engine type << 12 | method) names the sender for EDEN_NX2_WRITER_DIAG.
+    void NoteWriter(u32 source = 0) {
         last_writer_position = write_position;
+        last_writer_source = source;
+    }
+    [[nodiscard]] u32 WriterSource() const {
+        return last_writer_source;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
@@ -351,6 +356,7 @@ private:
     u64 last_writer_position{};
     u64 last_barrier_position{};
     u32 last_barrier_source{};
+    u32 last_writer_source{};
     // Queued tracked writes: the ring position after the last write to each 64-byte block.
     static constexpr u64 WriteBlockShift = 6;
     static constexpr u64 MaxWriteBlocks = 1024;
