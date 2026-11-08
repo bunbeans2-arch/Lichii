@@ -76,7 +76,7 @@ bool OotEnvSwitch(const char* name, bool default_on) {
 }
 
 bool OotOcclusionOffEnabled() {
-    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_OCCLUSION_OFF", true);
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_OCCLUSION_OFF", false);
     return enabled;
 }
 
