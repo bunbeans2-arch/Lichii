@@ -437,6 +437,30 @@ private:
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+    /// EDEN_NX2_FD_CENSUS: where the draw would stand against the previous draw if only the
+    /// classes in `mask` had broken the chain (read once the caches are locked).
+    void NoteCensus(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u32 mask);
+    void ReportFastDrawsV7(double seconds);
+    struct FastDrawV7Stats {
+        /// EDEN_NX2_FAST_DRAW_VERIFY, only draws DeltaStillHolds would have sent down the delta
+        /// path (v6's counters also count draws it sends to a full resolve).
+        u64 verified_holding{};
+        u64 holding_view_mismatches{};
+        u64 holding_binding_mismatches{};
+        u64 alias_tick_mismatches{};
+        /// EDEN_NX2_FD_CENSUS: structural reasons, then break class masks of the rest.
+        u64 census_no_candidate{};
+        u64 census_kind{};
+        u64 census_pipeline{};
+        u64 census_submitted{};
+        u64 census_render_pass{};
+        u64 census_other{};
+        std::array<u32, 1U << VideoCommon::Nx2FastDraw::CensusBits> census_masks{};
+    };
+    FastDrawV7Stats v7_stats;
+    u64 alias_tick_total{};          ///< Never reset: must stay 0
+    u64 holding_mismatch_total{};    ///< Never reset: must stay 0
+    ReusableDraw census_candidate;   ///< reusable_draw as TakeReusableDraw found it
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.

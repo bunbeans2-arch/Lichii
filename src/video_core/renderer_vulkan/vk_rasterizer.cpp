@@ -446,6 +446,9 @@ RasterizerVulkan::~RasterizerVulkan() {
 
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
+    if (FastDraw::Sw().census) {
+        census_candidate = reusable_draw;
+    }
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
@@ -568,6 +571,110 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
     };
 }
 
+void RasterizerVulkan::NoteCensus(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect,
+                                  u32 mask) {
+    // TakeReusableDraw's and DeltaStillHolds' checks in their order, without the serial.
+    const ReusableDraw& c = census_candidate;
+    FastDrawV7Stats& s = v7_stats;
+    if (c.pipeline == nullptr) {
+        ++s.census_no_candidate;
+        return;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (is_indirect || c.is_indexed != is_indexed || c.maxwell3d != maxwell3d ||
+        c.topology != draw_state.topology || !draw_state.inline_index_draw_indexes.empty() ||
+        frame_dump.Capturing()) {
+        ++s.census_kind;
+        return;
+    }
+    if (c.pipeline != pipeline || scheduler.BoundGraphicsPipeline() != c.pipeline) {
+        ++s.census_pipeline;
+        return;
+    }
+    if (c.tick != scheduler.CurrentTick()) {
+        ++s.census_submitted;
+        return;
+    }
+    if (c.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
+        ++s.census_render_pass;
+        return;
+    }
+    if (c.map_serial != gpu_memory->MapSerial() || !pipeline->TakesDeltaDraws()) {
+        ++s.census_other;
+        return;
+    }
+    ++s.census_masks[mask & ((1U << VideoCommon::Nx2FastDraw::CensusBits) - 1)];
+}
+
+void RasterizerVulkan::ReportFastDrawsV7(double seconds) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    FastDrawV7Stats& s = v7_stats;
+    const auto rate = [&](u64 n) { return static_cast<double>(n) / seconds; };
+    if (fast_draw_verify) {
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw v7 verify per second: {:.0f} checked that would hold, {:.0f} view or "
+                 "sampler mismatches, {:.0f} kept buffer binding mismatches, {:.0f} alias tick "
+                 "mismatches (totals {} holding mismatches, {} alias tick mismatches)",
+                 rate(s.verified_holding), rate(s.holding_view_mismatches),
+                 rate(s.holding_binding_mismatches), rate(s.alias_tick_mismatches),
+                 holding_mismatch_total, alias_tick_total);
+    }
+    if (FastDraw::Sw().census) {
+        const auto holds = [&](u32 neutral) {
+            u64 n = 0;
+            for (u32 m = 0; m < s.census_masks.size(); ++m) {
+                n += (m & ~neutral) == 0 ? s.census_masks[m] : 0;
+            }
+            return rate(n);
+        };
+        static constexpr std::array<std::pair<const char*, u32>, 7> steps{{
+            {"as-is", 0},
+            {"+vertex id base", FastDraw::CensusVertexIdBase},
+            {"+alias", FastDraw::CensusAlias},
+            {"+query/cond", FastDraw::CensusQuery | FastDraw::CensusCond},
+            {"+barrier", FastDraw::CensusBarrier},
+            {"+fence/handle", FastDraw::CensusFenceRelease | FastDraw::CensusHandleData},
+            {"+soft registers", FastDraw::CensusSoftRegister},
+        }};
+        std::string cumulative;
+        u32 set = 0;
+        for (const auto& [name, bits] : steps) {
+            set |= bits;
+            cumulative += fmt::format(" {} {:.0f}", name, holds(set));
+        }
+        std::string alone;
+        for (u32 bit = 0; bit < FastDraw::CensusBits; ++bit) {
+            alone += fmt::format(" {} {:.0f}", FastDraw::census_names[bit], holds(1U << bit));
+        }
+        std::vector<std::pair<u32, u32>> masks;
+        for (u32 m = 1; m < s.census_masks.size(); ++m) {
+            if (s.census_masks[m] != 0) {
+                masks.emplace_back(s.census_masks[m], m);
+            }
+        }
+        const size_t shown = std::min<size_t>(masks.size(), 8);
+        std::partial_sort(masks.begin(), masks.begin() + shown, masks.end(), std::greater{});
+        std::string top;
+        for (size_t i = 0; i < shown; ++i) {
+            std::string classes;
+            for (u32 bit = 0; bit < FastDraw::CensusBits; ++bit) {
+                if (((masks[i].second >> bit) & 1) != 0) {
+                    classes += (classes.empty() ? "" : "+") + std::string{FastDraw::census_names[bit]};
+                }
+            }
+            top += fmt::format(" [{}] {:.0f}", classes, rate(masks[i].first));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw census per second: structural: no candidate {:.0f}, kind {:.0f}, "
+                 "pipeline changed {:.0f}, submitted {:.0f}, render pass {:.0f}, other {:.0f} | "
+                 "would hold (cumulative):{} | each alone:{} | top break sets:{}",
+                 rate(s.census_no_candidate), rate(s.census_kind), rate(s.census_pipeline),
+                 rate(s.census_submitted), rate(s.census_render_pass), rate(s.census_other),
+                 cumulative, alone, top);
+    }
+    s = {};
+}
+
 void RasterizerVulkan::ReportFastDraws() {
     const u64 now = VideoCommon::Nx2Profile::Now();
     FastDrawStats& stats = fast_draw_stats;
@@ -578,9 +685,13 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY, EDEN_NX2_FD_STATS or
+    // EDEN_NX2_FD_CENSUS. Measure fast draws with the last three: the GPU profile sends every
+    // 3D method through CallMethodSlow, which breaks on methods the fast path never breaks on.
+    const auto& sw = VideoCommon::Nx2FastDraw::Sw();
+    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify && !sw.stats && !sw.census) {
         stats = FastDrawStats{.window_start = now};
+        v7_stats = {};
         return;
     }
     const double seconds = static_cast<double>(now - stats.window_start) / 1e9;
@@ -667,6 +778,7 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
              breaks, top);
+    ReportFastDrawsV7(seconds);
     stats = FastDrawStats{.window_start = now};
 }
 
@@ -790,6 +902,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         reusable_draw = {};
         FastDraw::g_delta = {};
         fast_draw_stats = {};
+        v7_stats = {};
     }
     fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
     const u64 fast_draw_start = fast_draw_on ? Profile::Now() : 0;
@@ -1042,6 +1155,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // break from here on, this draw's own resolve included, ends the delta chain.
     const u64 draw_serial = FastDraw::Serial();
     const u64 draw_map_serial = gpu_memory->MapSerial();
+    if (fast_draw_on) {
+        FastDraw::LatchDraw(draw_serial);
+        if (FastDraw::Sw().census) {
+            // The classes of every break since the previous draw latched its serial.
+            NoteCensus(pipeline, is_indexed, is_indirect,
+                       FastDraw::g_census.exchange(0, std::memory_order_relaxed));
+        }
+    }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
@@ -1070,6 +1191,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // What the delta draw would have kept: the texture buffer bindings.
         const u64 kept_bindings =
             verify_views ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
+        const bool verify_holding = verify_views && delta_holds;
+        if (verify_holding) {
+            // Before Configure prepares (and so synchronizes) the kept views' images.
+            ++v7_stats.verified_holding;
+            const u64 alias_mismatches = texture_cache.AliasTickMismatches(pipeline->DeltaViews());
+            v7_stats.alias_tick_mismatches += alias_mismatches;
+            alias_tick_total += alias_mismatches;
+        }
         if (fast_draw_on) {
             pipeline->CaptureNextDelta(verify_views);
         }
@@ -1080,10 +1209,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (verify_views && pipeline->DeltaMismatch()) {
             ++fast_draw_stats.view_mismatches;
+            if (verify_holding) {
+                ++v7_stats.holding_view_mismatches;
+                ++holding_mismatch_total;
+            }
         }
         if (verify_views &&
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
             ++fast_draw_stats.binding_mismatches;
+            if (verify_holding) {
+                ++v7_stats.holding_binding_mismatches;
+                ++holding_mismatch_total;
+            }
         }
     }
 

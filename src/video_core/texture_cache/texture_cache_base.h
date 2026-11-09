@@ -303,6 +303,25 @@ public:
         return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
     }
 
+    /// EDEN_NX2_FAST_DRAW_VERIFY: kept views whose image has an alias modified after it (what
+    /// SynchronizeAliases would copy, found by walking the aliases) while SamplingChangesImage
+    /// says sampling it changes nothing. Must stay 0 (EDEN_NX2_FD_ALIAS relies on it).
+    [[nodiscard]] u64 AliasTickMismatches(std::span<const ImageViewInOut> views) const {
+        u64 mismatches = 0;
+        for (const ImageViewInOut& view : views) {
+            if (!VideoCommon::PreparesImage(slot_image_views, view.id)) {
+                continue;
+            }
+            const ImageBase& image = slot_images[slot_image_views[view.id].image_id];
+            const bool newer =
+                std::ranges::any_of(image.aliased_images, [&](const AliasedImage& alias) {
+                    return slot_images[alias.id].modification_tick > image.modification_tick;
+                });
+            mismatches += newer && !VideoCommon::SamplingChangesImage(image) ? 1 : 0;
+        }
+        return mismatches;
+    }
+
     /// EDEN_NX2_TEXTURE_MEMO_VERIFY: PrepareImage adds the images it is asked to prepare to `log`
     /// (nullptr stops it) and, with `dry`, does nothing else.
     void LogPrepares(std::vector<ImageId>* log, bool dry) noexcept {

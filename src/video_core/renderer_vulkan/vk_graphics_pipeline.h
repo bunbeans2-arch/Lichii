@@ -323,6 +323,11 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
+    /// The views a delta draw keeps (EDEN_NX2_FAST_DRAW_VERIFY alias tick check).
+    [[nodiscard]] std::span<const VideoCommon::ImageViewInOut> DeltaViews() const noexcept {
+        return delta_views;
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };

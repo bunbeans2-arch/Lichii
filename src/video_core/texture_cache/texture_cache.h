@@ -4193,8 +4193,13 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     // A fast (delta) draw skips PrepareImageView and so SynchronizeAliases: after a write to an
     // image with aliases, resolve the next draw in full so a sampled alias gets the new contents
     // (H17 review; the same gap exists upstream in #858, and VERIFY compares ids only).
-    if (!image.aliased_images.empty()) {
-        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+    // EDEN_NX2_FD_ALIAS=1: no break. SetModificationTick just raised every alias's
+    // newest_alias_tick past its own modification_tick, so DeltaStillHolds' DeltaImagesChange
+    // (SamplingChangesImage) sends the next draw that samples an alias to a full resolve, whose
+    // PrepareImageView runs SynchronizeAliases, the invariant SynchronizeAliases' own early-out
+    // already relies on. VERIFY's AliasTickMismatches checks it.
+    if (!image.aliased_images.empty() && !VideoCommon::Nx2FastDraw::Sw().alias) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::AliasWrite);
     }
 }
 

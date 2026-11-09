@@ -3280,6 +3280,9 @@ public:
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// Fast draw v7 (EDEN_NX2_FD_QUERY, _COND, _BARRIER): executable methods that keep draw
+    /// reuse. Reads the registers ProcessDirtyRegisters just stored.
+    bool IsFastDrawNeutralMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
 
     /// Handles a write to the CB_DATA[i] register.
