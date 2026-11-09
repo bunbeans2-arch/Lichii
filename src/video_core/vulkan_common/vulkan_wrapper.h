@@ -27,6 +27,7 @@
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
+struct VmaDeviceMemoryCallbacks;
 
 namespace Vulkan::vk {
 
@@ -787,6 +788,14 @@ public:
     /// An image kept under this key, if any.
     static bool Take(u64 key, VmaAllocator allocator, VkImage& handle,
                      VmaAllocation& allocation) noexcept;
+    /// LICHII_IMG_RECYCLE_DIAG=1: the image made after this thread's last Take missed (its
+    /// allocation, its size, and whether it came from the medium-image pool), for the
+    /// miss-reason line. Nothing otherwise.
+    static void NoteCreated(VmaAllocator allocator, VmaAllocation allocation, u64 size,
+                            bool medium_pool) noexcept;
+    /// LICHII_IMG_RECYCLE_DIAG=1: VMA callbacks counting vkAllocateMemory/vkFreeMemory for the
+    /// recycler's 10 s lines (VmaAllocatorCreateInfo::pDeviceMemoryCallbacks); else nullptr.
+    [[nodiscard]] static const VmaDeviceMemoryCallbacks* DeviceMemoryCallbacks() noexcept;
     /// Destroys every kept image of this allocator and keeps nothing more (allocator teardown).
     static void Clear(VmaAllocator allocator) noexcept;
     /// Keeps images of a new allocator again, though it has the address of a cleared one.

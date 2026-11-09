@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -561,23 +562,68 @@ bool RecyclerDiag() noexcept {
     return enabled;
 }
 
-enum class DropReason : u8 { Age = 1, Cap = 2 };
+/// Why a kept image was dropped: kept longer than RecycleKeepTime, room under the cap (Put),
+/// the texture cache collector's Shrink, or Purge (out of device memory).
+enum class DropReason : u8 { Age, Cap, Shrink, Purge };
+
+/// Why Take found nothing. Shape = a kept image of the same create info except extent, levels
+/// and layers (it cannot be handed out; its memory could be, by binding a new VkImage).
+enum class MissClass : u8 { Cold, Shape, Age, Cap, Shrink, Purge, Count };
+
+constexpr MissClass MissOf(DropReason reason) noexcept {
+    switch (reason) {
+    case DropReason::Age:
+        return MissClass::Age;
+    case DropReason::Cap:
+        return MissClass::Cap;
+    case DropReason::Shrink:
+        return MissClass::Shrink;
+    case DropReason::Purge:
+        break;
+    }
+    return MissClass::Purge;
+}
 
 /// Set by KeyOf right before the same thread's Take (MemoryAllocator::AllocateImage).
 thread_local u64 t_last_shape = 0;
+/// Set by Take on a miss (class + 1; 0 = hit), read by the same thread's NoteCreated.
+thread_local u8 t_last_miss = 0;
 /// Recyclable creations whose create info has no key (an unknown pNext), diag only.
 std::atomic<u64> g_diag_no_key{0};
+/// Diag: every vkAllocateMemory/vkFreeMemory VMA makes (images and buffers), this log window.
+std::atomic<u64> g_diag_vk_allocs{0};
+std::atomic<u64> g_diag_vk_alloc_bytes{0};
+std::atomic<u64> g_diag_vk_frees{0};
+std::atomic<u64> g_diag_vk_free_bytes{0};
+
+void VKAPI_PTR DiagAllocateDeviceMemory(VmaAllocator, u32, VkDeviceMemory, VkDeviceSize size,
+                                        void*) {
+    g_diag_vk_allocs.fetch_add(1, std::memory_order_relaxed);
+    g_diag_vk_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void VKAPI_PTR DiagFreeDeviceMemory(VmaAllocator, u32, VkDeviceMemory, VkDeviceSize size, void*) {
+    g_diag_vk_frees.fetch_add(1, std::memory_order_relaxed);
+    g_diag_vk_free_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+struct DropRecord {
+    DropReason reason;
+    u32 count; ///< images of this key dropped and not yet missed again
+    std::chrono::steady_clock::time_point when; ///< last drop
+};
 
 struct RecyclerDiagState {
-    std::unordered_map<u64, u64> shape_of; ///< key -> shape, filled by Take
-    std::unordered_map<u64, DropReason> dropped; ///< key -> why an image of it was dropped last
-    u64 miss_cold = 0;  ///< nothing of this key or shape kept or dropped
-    u64 miss_shape = 0; ///< an image of the same shape kept, other extent/levels/layers
-    u64 miss_aged = 0;  ///< an image of this key was dropped after RecycleKeepTime
-    u64 miss_cap = 0;   ///< an image of this key was dropped to make room under the cap
+    std::unordered_map<u64, u64> shape_of;       ///< key -> shape, filled by Take
+    std::unordered_map<u64, DropRecord> dropped; ///< key -> its dropped images
+    std::array<u64, static_cast<size_t>(MissClass::Count)> misses{};
+    std::array<u64, static_cast<size_t>(MissClass::Count)> miss_bytes{}; ///< from NoteCreated
+    std::array<u64, 3> aged_gap{};  ///< aged misses by time since the drop: <20 s, <60 s, more
+    std::array<u64, 3> miss_size{}; ///< created after a miss: <8 MiB, 8-64 MiB, more
+    std::array<u64, 3> miss_path{}; ///< created after a miss: shared block, medium pool, dedicated
+    u64 shape_fits = 0; ///< Shape misses whose new image fits a kept image's memory of its shape
     u64 put_big = 0;    ///< released images larger than the cap (destroyed)
-    u64 dropped_age_bytes = 0;
-    u64 dropped_cap_bytes = 0;
+    std::array<u64, 4> dropped_bytes{}; ///< by DropReason
 };
 
 struct RecyclerState {
@@ -663,18 +709,29 @@ void Bury(std::vector<RecycledImage>&& images) {
     graveyard.cv.notify_one();
 }
 
+/// Diag: notes a kept image being dropped.
+void NoteDrop(RecyclerState& state, const RecycledImage& image, DropReason reason,
+              std::chrono::steady_clock::time_point now) {
+    CapDiagMap(state.diag.dropped);
+    const auto it = state.diag.dropped.try_emplace(image.key, DropRecord{reason, 0, now}).first;
+    it->second.reason = reason;
+    it->second.when = now;
+    ++it->second.count;
+    state.diag.dropped_bytes[static_cast<size_t>(reason)] += image.size;
+}
+
 /// Drops kept images that are too old, or the oldest until `room` more bytes fit the cap.
-void TrimRecycler(RecyclerState& state, u64 room, std::chrono::steady_clock::time_point now) {
+/// `reason`: why a drop that is not for age happens (Put: Cap, the collector: Shrink).
+void TrimRecycler(RecyclerState& state, u64 room, std::chrono::steady_clock::time_point now,
+                  DropReason reason = DropReason::Cap) {
     size_t drop = 0;
     u64 bytes = state.bytes;
     while (drop < state.images.size() &&
            (now - state.images[drop].kept > RecycleKeepTime || bytes + room > RecyclerCap())) {
         if (RecyclerDiag()) {
             const RecycledImage& image = state.images[drop];
-            const bool aged = now - image.kept > RecycleKeepTime;
-            CapDiagMap(state.diag.dropped);
-            state.diag.dropped[image.key] = aged ? DropReason::Age : DropReason::Cap;
-            (aged ? state.diag.dropped_age_bytes : state.diag.dropped_cap_bytes) += image.size;
+            NoteDrop(state, image, now - image.kept > RecycleKeepTime ? DropReason::Age : reason,
+                     now);
         }
         bytes -= state.images[drop].size;
         ++drop;
@@ -816,20 +873,30 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
             CapDiagMap(diag.shape_of);
             diag.shape_of[key] = shape;
         }
+        t_last_miss = 0;
         if (!found) {
+            MissClass miss = MissClass::Cold;
             const auto dropped = diag.dropped.find(key);
             if (dropped != diag.dropped.end()) {
-                ++(dropped->second == DropReason::Cap ? diag.miss_cap : diag.miss_aged);
-                diag.dropped.erase(dropped);
+                miss = MissOf(dropped->second.reason);
+                if (miss == MissClass::Age) {
+                    const auto gap = now - dropped->second.when;
+                    ++diag.aged_gap[gap < std::chrono::seconds{20}   ? 0
+                                    : gap < std::chrono::seconds{60} ? 1
+                                                                     : 2];
+                }
+                if (--dropped->second.count == 0) {
+                    diag.dropped.erase(dropped);
+                }
             } else if (shape != 0 &&
                        std::any_of(state.images.begin(), state.images.end(),
                                    [shape, allocator](const RecycledImage& image) {
                                        return image.shape == shape && image.allocator == allocator;
                                    })) {
-                ++diag.miss_shape;
-            } else {
-                ++diag.miss_cold;
+                miss = MissClass::Shape;
             }
+            ++diag.misses[static_cast<size_t>(miss)];
+            t_last_miss = static_cast<u8>(static_cast<u8>(miss) + 1);
         }
     }
     if (now - state.log_since >= std::chrono::seconds{10}) {
@@ -842,17 +909,48 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
                  static_cast<double>(state.bytes) / (1 << 20));
         if (RecyclerDiag()) {
             RecyclerDiagState& diag = state.diag;
+            const auto n = [&diag](MissClass miss) {
+                return diag.misses[static_cast<size_t>(miss)];
+            };
+            const auto mib = [](u64 bytes) { return static_cast<double>(bytes) / (1 << 20); };
+            const auto miss_mib = [&diag, &mib](MissClass miss) {
+                return mib(diag.miss_bytes[static_cast<size_t>(miss)]);
+            };
+            const auto drop_mib = [&diag, &mib](DropReason reason) {
+                return mib(diag.dropped_bytes[static_cast<size_t>(reason)]);
+            };
             LOG_INFO(Render_Vulkan,
-                     "Image recycler misses: {} cold, {} other size (same shape kept), {} aged "
-                     "out, {} cap drop; {} no key, {} too big; dropped {:.1f} MiB aged, {:.1f} "
-                     "MiB for cap; cap {:.0f} MiB",
-                     diag.miss_cold, diag.miss_shape, diag.miss_aged, diag.miss_cap,
-                     g_diag_no_key.exchange(0, std::memory_order_relaxed), diag.put_big,
-                     static_cast<double>(diag.dropped_age_bytes) / (1 << 20),
-                     static_cast<double>(diag.dropped_cap_bytes) / (1 << 20),
-                     static_cast<double>(RecyclerCap()) / (1 << 20));
-            diag.miss_cold = diag.miss_shape = diag.miss_aged = diag.miss_cap = 0;
-            diag.put_big = diag.dropped_age_bytes = diag.dropped_cap_bytes = 0;
+                     "Image recycler misses (made MiB): {} cold ({:.1f}), {} other size ({:.1f}; "
+                     "{} fit a kept image's memory), {} aged ({:.1f}; dropped <20 s before {}, "
+                     "<60 s {}, longer {}), {} cap ({:.1f}), {} shrink ({:.1f}), {} purge "
+                     "({:.1f}); new image <8 MiB {}, 8-64 MiB {}, >64 MiB {}; in a shared block "
+                     "{}, medium pool {}, dedicated {}; {} no key, {} too big",
+                     n(MissClass::Cold), miss_mib(MissClass::Cold), n(MissClass::Shape),
+                     miss_mib(MissClass::Shape), diag.shape_fits, n(MissClass::Age),
+                     miss_mib(MissClass::Age), diag.aged_gap[0], diag.aged_gap[1],
+                     diag.aged_gap[2], n(MissClass::Cap), miss_mib(MissClass::Cap),
+                     n(MissClass::Shrink), miss_mib(MissClass::Shrink), n(MissClass::Purge),
+                     miss_mib(MissClass::Purge), diag.miss_size[0], diag.miss_size[1],
+                     diag.miss_size[2], diag.miss_path[0], diag.miss_path[1], diag.miss_path[2],
+                     g_diag_no_key.exchange(0, std::memory_order_relaxed), diag.put_big);
+            LOG_INFO(Render_Vulkan,
+                     "Image recycler drops (MiB): {:.1f} aged, {:.1f} cap, {:.1f} shrink, {:.1f} "
+                     "purge; cap {:.0f} MiB; all VMA vkAllocateMemory {} ({:.1f} MiB), "
+                     "vkFreeMemory {} ({:.1f} MiB)",
+                     drop_mib(DropReason::Age), drop_mib(DropReason::Cap),
+                     drop_mib(DropReason::Shrink), drop_mib(DropReason::Purge),
+                     mib(RecyclerCap()), g_diag_vk_allocs.exchange(0, std::memory_order_relaxed),
+                     mib(g_diag_vk_alloc_bytes.exchange(0, std::memory_order_relaxed)),
+                     g_diag_vk_frees.exchange(0, std::memory_order_relaxed),
+                     mib(g_diag_vk_free_bytes.exchange(0, std::memory_order_relaxed)));
+            diag.misses.fill(0);
+            diag.miss_bytes.fill(0);
+            diag.aged_gap.fill(0);
+            diag.miss_size.fill(0);
+            diag.miss_path.fill(0);
+            diag.dropped_bytes.fill(0);
+            diag.shape_fits = 0;
+            diag.put_big = 0;
         }
         state.takes = 0;
         state.misses = 0;
@@ -860,6 +958,46 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
     }
     TrimRecycler(state, 0, now);
     return found;
+}
+
+void ImageRecycler::NoteCreated(VmaAllocator allocator, VmaAllocation allocation, u64 size,
+                                bool medium_pool) noexcept {
+    if (!RecyclerDiag() || t_last_miss == 0) {
+        return;
+    }
+    const auto miss = static_cast<MissClass>(t_last_miss - 1);
+    const u64 shape = t_last_shape;
+    t_last_miss = 0;
+    bool dedicated = false;
+    if (!medium_pool) {
+        VmaAllocationInfo2 info{};
+        vmaGetAllocationInfo2(allocator, allocation, &info);
+        dedicated = info.dedicatedMemory != VK_FALSE;
+    }
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    RecyclerDiagState& diag = state.diag;
+    diag.miss_bytes[static_cast<size_t>(miss)] += size;
+    constexpr u64 MiB = u64{1} << 20;
+    ++diag.miss_size[size < 8 * MiB ? 0 : size <= 64 * MiB ? 1 : 2];
+    ++diag.miss_path[medium_pool ? 1 : dedicated ? 2 : 0];
+    if (miss == MissClass::Shape &&
+        std::any_of(state.images.begin(), state.images.end(),
+                    [shape, allocator, size](const RecycledImage& image) {
+                        return image.shape == shape && image.allocator == allocator &&
+                               image.size >= size;
+                    })) {
+        ++diag.shape_fits;
+    }
+}
+
+const VmaDeviceMemoryCallbacks* ImageRecycler::DeviceMemoryCallbacks() noexcept {
+    static const VmaDeviceMemoryCallbacks callbacks{
+        .pfnAllocate = DiagAllocateDeviceMemory,
+        .pfnFree = DiagFreeDeviceMemory,
+        .pUserData = nullptr,
+    };
+    return RecyclerDiag() ? &callbacks : nullptr;
 }
 
 u64 ImageRecycler::KeptBytes() noexcept {
@@ -878,7 +1016,8 @@ void ImageRecycler::Shrink(u64 bytes) noexcept {
     // nothing (room = cap). Dropping the oldest until `cap - bytes` more fit leaves at most
     // `bytes`.
     const u64 cap = RecyclerCap();
-    TrimRecycler(state, cap > bytes ? cap - bytes : cap, std::chrono::steady_clock::now());
+    TrimRecycler(state, cap > bytes ? cap - bytes : cap, std::chrono::steady_clock::now(),
+                 DropReason::Shrink);
 }
 
 void ImageRecycler::SetCap(u64 bytes) noexcept {
@@ -895,9 +1034,13 @@ u64 ImageRecycler::Purge(VmaAllocator allocator) noexcept {
     RecyclerState& state = Recycler();
     std::scoped_lock lock{state.mutex};
     u64 freed = 0;
-    std::erase_if(state.images, [&state, &freed, allocator](const RecycledImage& image) {
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(state.images, [&state, &freed, allocator, now](const RecycledImage& image) {
         if (image.allocator != allocator) {
             return false;
+        }
+        if (RecyclerDiag()) {
+            NoteDrop(state, image, DropReason::Purge, now);
         }
         vmaDestroyImage(image.allocator, image.handle, image.allocation);
         state.bytes -= image.size;

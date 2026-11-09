@@ -837,7 +837,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
             .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
-            .pDeviceMemoryCallbacks = nullptr,
+            // LICHII_IMG_RECYCLE_DIAG=1: counts vkAllocateMemory/vkFreeMemory; else nullptr.
+            .pDeviceMemoryCallbacks = vk::ImageRecycler::DeviceMemoryCallbacks(),
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,

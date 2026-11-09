@@ -450,10 +450,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    bool from_medium_pool = false;
     if (!dedicated && !huge && texels >= (u64{1} << 20) && MediumImagePoolEnabled() &&
         MayFitMediumPool(ci, texels) && AllocateMediumImage(ci, handle, allocation)) {
         vmaGetAllocationInfo(allocator, allocation, &alloc_info);
         result = VK_SUCCESS;
+        from_medium_pool = true;
     } else if (!huge) {
         result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     }
@@ -538,6 +540,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
 
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
+    if (recycle_key != 0) {
+        vk::ImageRecycler::NoteCreated(allocator, allocation, alloc_info.size, from_medium_pool);
+    }
     // Images placed in host memory under memory pressure are freed rather than kept.
     if (recycle_key != 0 && alloc_info.memoryType < properties.memoryTypeCount &&
         (properties.memoryTypes[alloc_info.memoryType].propertyFlags &
