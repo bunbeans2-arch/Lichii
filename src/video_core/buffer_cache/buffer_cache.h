@@ -119,7 +119,12 @@ void BufferCache<P>::TickFrame() {
         }
         uploaded_buffer_ranges.clear();
     }
-    if (static u64 frames{}; ++frames % 600 == 0) {
+    // LICHII_DIPFIX=0 restores the periodic buffer census log outside profiling runs.
+    static const bool census_always = [] {
+        const char* value = std::getenv("LICHII_DIPFIX");
+        return value && value[0] == '0';
+    }();
+    if (static u64 frames{}; ++frames % 600 == 0 && (census_always || Nx2Profile::Enabled())) {
         u64 total{};
         size_t count{};
         std::vector<std::pair<u64, VAddr>> largest;

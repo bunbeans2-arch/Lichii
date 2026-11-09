@@ -255,6 +255,21 @@ public:
         transitions.clear();
     }
 
+    /// Forgets only the transitions to pipelines in `gone` (sorted), keeping the rest.
+    void ForgetTransitionsTo(std::span<GraphicsPipeline* const> gone) noexcept {
+        size_t out = 0;
+        for (size_t i = 0; i < transitions.size(); ++i) {
+            if (std::binary_search(gone.begin(), gone.end(), transitions[i])) {
+                continue;
+            }
+            transition_keys[out] = transition_keys[i];
+            transitions[out] = transitions[i];
+            ++out;
+        }
+        transition_keys.resize(out);
+        transitions.resize(out);
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }

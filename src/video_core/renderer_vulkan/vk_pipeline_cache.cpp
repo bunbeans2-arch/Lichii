@@ -1583,6 +1583,12 @@ void PipelineCache::EvictUnusedPipelines() {
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
     size_t kept_prebuilt = 0;
     size_t evicted = 0;
+    // LICHII_DIPFIX=0 restores clearing every pipeline's transitions on any eviction.
+    static const bool dipfix = [] {
+        const char* value = std::getenv("LICHII_DIPFIX");
+        return !(value && value[0] == '0');
+    }();
+    std::vector<GraphicsPipeline*> gone;
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         GraphicsPipeline* const pipeline = it->second.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
@@ -1603,6 +1609,7 @@ void PipelineCache::EvictUnusedPipelines() {
         if (used_this_session.erase(pipeline) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
+        gone.push_back(pipeline);
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         it = graphics_cache.erase(it);
         ++evicted;
@@ -1610,9 +1617,14 @@ void PipelineCache::EvictUnusedPipelines() {
     if (evicted == 0) {
         return;
     }
+    std::sort(gone.begin(), gone.end());
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
-            pipeline->ClearTransitions();
+            if (dipfix) {
+                pipeline->ForgetTransitionsTo(gone);
+            } else {
+                pipeline->ClearTransitions();
+            }
         }
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
