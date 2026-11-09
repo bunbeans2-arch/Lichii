@@ -20,6 +20,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -165,7 +166,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
+        hash_log_reason = HashLogReason::Gc;
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        hash_log_reason = HashLogReason::Other;
     };
     const auto FlushPending = [&] {
         if (pending.empty()) {
@@ -492,7 +495,109 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 }
 
 template <class P>
+bool TextureCache<P>::HashLogEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_TC_HASHLOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+template <class P>
+u64 TextureCache<P>::HashLogKey(const ImageBase& image) {
+    const size_t size = (std::min)(static_cast<size_t>(image.guest_size_bytes), size_t{1} << 20);
+    hash_log_scratch.assign(size, u8{0});
+    // Only mapped memory is read (unmapping or fake-address images hash as zeros).
+    if (size != 0 && gpu_memory != nullptr && hash_log_reason != HashLogReason::Unmap &&
+        gpu_memory->GpuToCpuAddress(image.gpu_addr, size)) {
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, hash_log_scratch.data(), size);
+    }
+    u64 key = Common::CityHash64(reinterpret_cast<const char*>(hash_log_scratch.data()), size);
+    const u64 shape = (u64{image.info.size.width} << 40) ^ (u64{image.info.size.height} << 20) ^
+                      (u64{static_cast<u32>(image.info.resources.levels)} << 12) ^
+                      static_cast<u64>(image.info.format);
+    key ^= shape * 0x9E3779B97F4A7C15ULL;
+    return key;
+}
+
+template <class P>
+void TextureCache<P>::HashLogCreate(ImageId image_id) {
+    const ImageBase& image = slot_images[image_id];
+    const u64 key = HashLogKey(image);
+    hash_log_live[image_id.index] = key;
+    HashLogEntry& entry = hash_log_seen[key];
+    const bool again = entry.deletes > 0;
+    ++entry.creates;
+    ++hash_log_created;
+    hash_log_created_bytes += image.guest_size_bytes;
+    if (again) {
+        ++hash_log_recreated;
+        hash_log_recreated_bytes += image.guest_size_bytes;
+    }
+    if (hash_log_lines < 4000) {
+        ++hash_log_lines;
+        LOG_INFO(HW_GPU, "TC hash create {:#x} {}x{} levels {} format {} {} B key {:016x}{}",
+                 image.gpu_addr, image.info.size.width, image.info.size.height,
+                 image.info.resources.levels, static_cast<u32>(image.info.format),
+                 image.guest_size_bytes, key, again ? " AGAIN" : "");
+    }
+}
+
+template <class P>
+void TextureCache<P>::HashLogDelete(ImageId image_id) {
+    static constexpr std::array<const char*, static_cast<size_t>(HashLogReason::Count)> names{
+        "gc", "unmap", "join", "join_copy", "other"};
+    const ImageBase& image = slot_images[image_id];
+    const auto it = hash_log_live.find(image_id.index);
+    const u64 created_key = it != hash_log_live.end() ? it->second : 0;
+    if (it != hash_log_live.end()) {
+        hash_log_live.erase(it);
+    }
+    const u64 now_key = HashLogKey(image);
+    const bool changed = created_key != 0 && now_key != created_key;
+    if (changed) {
+        ++hash_log_changed;
+    }
+    if (created_key != 0) {
+        ++hash_log_seen[created_key].deletes;
+    }
+    const size_t reason = static_cast<size_t>(hash_log_reason);
+    ++hash_log_deleted[reason];
+    if (hash_log_lines < 4000) {
+        ++hash_log_lines;
+        LOG_INFO(HW_GPU, "TC hash delete {:#x} {}x{} format {} reason {} key {:016x}{}",
+                 image.gpu_addr, image.info.size.width, image.info.size.height,
+                 static_cast<u32>(image.info.format), names[reason], created_key,
+                 changed ? " CONTENT_CHANGED" : "");
+    }
+}
+
+template <class P>
+void TextureCache<P>::HashLogTick() {
+    if (++hash_log_frames % 300 != 0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "TC hash log (300 frames): created {} ({} MiB), re-created same content {} ({} MiB), "
+             "deleted gc/unmap/join/join_copy/other {}/{}/{}/{}/{}, deleted after guest content "
+             "changed {}, live {}, keys {}",
+             hash_log_created, hash_log_created_bytes >> 20, hash_log_recreated,
+             hash_log_recreated_bytes >> 20, hash_log_deleted[0], hash_log_deleted[1],
+             hash_log_deleted[2], hash_log_deleted[3], hash_log_deleted[4], hash_log_changed,
+             hash_log_live.size(), hash_log_seen.size());
+    hash_log_created = hash_log_created_bytes = hash_log_recreated = hash_log_recreated_bytes = 0;
+    hash_log_changed = 0;
+    hash_log_deleted.fill(0);
+    if (hash_log_seen.size() > 200000) {
+        hash_log_seen.clear();
+    }
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
+    if (HashLogEnabled()) {
+        HashLogTick();
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -1347,7 +1452,9 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, id);
         }
         UnregisterImage(id);
+        hash_log_reason = HashLogReason::Unmap;
         DeleteImage(id);
+        hash_log_reason = HashLogReason::Other;
     }
     ClearStale(cpu_addr, size);
 }
@@ -2873,6 +2980,9 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     if (!image_id) {
         return image_id;
     }
+    if (HashLogEnabled()) {
+        HashLogCreate(image_id);
+    }
     const Image& image = slot_images[image_id];
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
@@ -3044,7 +3154,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, overlap_id);
         }
         UnregisterImage(overlap_id);
+        hash_log_reason = HashLogReason::Join;
         DeleteImage(overlap_id);
+        hash_log_reason = HashLogReason::Other;
     }
 
     // A new render target that the clear binding it overwrites whole (every channel, the whole
@@ -3257,7 +3369,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, copy_object.id);
         }
         UnregisterImage(copy_object.id);
+        hash_log_reason = HashLogReason::JoinCopy;
         DeleteImage(copy_object.id);
+        hash_log_reason = HashLogReason::Other;
     }
 
     RegisterImage(new_image_id);
@@ -3915,6 +4029,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    if (HashLogEnabled()) {
+        HashLogDelete(image_id);
+    }
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     MarkStale(image);

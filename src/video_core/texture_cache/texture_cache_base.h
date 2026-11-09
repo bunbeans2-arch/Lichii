@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <deque>
@@ -492,6 +493,15 @@ private:
     /// Delete image from the cache
     void DeleteImage(ImageId image, bool immediate_delete = false);
 
+    /// LICHII_TC_HASHLOG=1 (diagnostic only): hashes each new and deleted image's guest bytes
+    /// (first 1 MiB) and counts re-creations of content the cache deleted before.
+    enum class HashLogReason : u32 { Gc, Unmap, Join, JoinCopy, Other, Count };
+    static bool HashLogEnabled();
+    u64 HashLogKey(const ImageBase& image);
+    void HashLogCreate(ImageId image_id);
+    void HashLogDelete(ImageId image_id);
+    void HashLogTick();
+
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
 
@@ -702,6 +712,23 @@ private:
         ImageId id;
     };
     boost::container::small_vector<JoinCopy, 4> join_copies_to_do;
+
+    struct HashLogEntry {
+        u32 creates = 0;
+        u32 deletes = 0;
+    };
+    HashLogReason hash_log_reason = HashLogReason::Other;
+    std::vector<u8> hash_log_scratch;
+    std::unordered_map<u32, u64> hash_log_live;          ///< image slot index -> key at creation
+    std::unordered_map<u64, HashLogEntry> hash_log_seen; ///< key -> counts
+    u64 hash_log_created = 0;
+    u64 hash_log_created_bytes = 0;
+    u64 hash_log_recreated = 0;
+    u64 hash_log_recreated_bytes = 0;
+    u64 hash_log_changed = 0;
+    std::array<u64, static_cast<size_t>(HashLogReason::Count)> hash_log_deleted{};
+    u64 hash_log_lines = 0;
+    u64 hash_log_frames = 0;
     ::Common::unordered_map<ImageId, size_t> join_alias_indices;
 };
 
