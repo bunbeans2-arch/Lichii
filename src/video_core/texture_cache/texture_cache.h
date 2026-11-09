@@ -2189,6 +2189,49 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // LICHII_TC_TIMING=1 (diagnostic): how long each texture refresh takes on the GPU thread and by
+    // which path; one line per refresh over 0.5 ms and a summary every 10 s. Paths are unchanged.
+    static const bool tc_timing = [] {
+        const char* value = std::getenv("LICHII_TC_TIMING");
+        return value != nullptr && value[0] == '1';
+    }();
+    const char* refresh_path = "upload";
+    struct RefreshTimer {
+        bool on;
+        const ImageBase& image;
+        const char*& path;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~RefreshTimer() {
+            if (!on) {
+                return;
+            }
+            static u64 count{}, total_us{}, max_us{}, slow{}, slow_window{};
+            static auto window = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            const u64 us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+            ++count;
+            total_us += us;
+            max_us = (std::max)(max_us, us);
+            if (us >= 500) {
+                ++slow;
+                ++slow_window;
+                if (slow <= 2000) {
+                    LOG_INFO(HW_GPU, "TC refresh {} us ({}): {:#x} {}x{}x{} layers {} levels {} format {} {} B",
+                             us, path, image.gpu_addr, image.info.size.width, image.info.size.height,
+                             image.info.size.depth, image.info.resources.layers,
+                             image.info.resources.levels, static_cast<u32>(image.info.format),
+                             image.guest_size_bytes);
+                }
+            }
+            if (now - window >= std::chrono::seconds{10}) {
+                LOG_INFO(HW_GPU, "TC refresh timing (10 s): {} refreshes, {} ms total, max {} us, {} over 0.5 ms",
+                         count, total_us / 1000, max_us, slow_window);
+                count = total_us = max_us = slow_window = 0;
+                window = now;
+            }
+        }
+    } refresh_timer{tc_timing, image, refresh_path};
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2205,6 +2248,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         IsAllStale(image.cpu_addr, image.guest_size_bytes)) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
             ++tc_stale_skips;
+            refresh_path = "stale skip";
             tc_stale_skip_bytes += image.guest_size_bytes;
             runtime.TransitionImageLayout(image);
             return;
@@ -2213,14 +2257,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
+        refresh_path = "sparse layers";
         RefreshSparseLayers(image);
         return;
     }
     if (True(image.flags & ImageFlagBits::SparseTiles)) {
+        refresh_path = "sparse tiles";
         RefreshSparseTiles(image);
         return;
     }
     if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
+        refresh_path = "written layers";
         runtime.InsertUploadMemoryBarrier();
         return;
     }
@@ -2238,6 +2285,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
+        refresh_path = "async decode queued";
         QueueAsyncDecode(image, image_id);
         return;
     }
