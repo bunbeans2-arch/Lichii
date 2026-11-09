@@ -218,7 +218,7 @@ private:
                     return;
                 }
             }
-            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::FenceRelease);
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
@@ -282,7 +282,7 @@ private:
                 }
             }
             if (!batch.empty()) {
-                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::FenceRelease);
             }
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
@@ -310,7 +310,7 @@ private:
                 }
             }
             if (!batch.empty()) {
-                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::FenceRelease);
             }
             {
                 std::unique_lock lock(ring_guard);

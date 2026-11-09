@@ -365,7 +365,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-        !IsFastDrawParameter(method)) {
+        !VideoCommon::Nx2FastDraw::AlreadyBroken() && !IsFastDrawParameter(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
     }
     regs.reg_array[method] = argument;
@@ -373,7 +373,57 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         dirty.flags[table[method]] = true;
 }
 
+// The census in nx2_fast_draw.h names these registers by index.
+static_assert(MAXWELL3D_REG_INDEX(report_semaphore.address_high) == 0x6C0);
+static_assert(MAXWELL3D_REG_INDEX(report_semaphore.query) == 0x6C3);
+static_assert(MAXWELL3D_REG_INDEX(clear_report_value) == 0x54C);
+static_assert(MAXWELL3D_REG_INDEX(zpass_pixel_count_enable) == 0x545);
+static_assert(MAXWELL3D_REG_INDEX(render_enable.address_high) == 0x554);
+static_assert(MAXWELL3D_REG_INDEX(render_enable.mode) == 0x556);
+static_assert(MAXWELL3D_REG_INDEX(render_enable_override) == 0x651);
+static_assert(MAXWELL3D_REG_INDEX(fragment_barrier) == 0x378);
+static_assert(MAXWELL3D_REG_INDEX(tiled_cache_barrier) == 0x3DF);
+static_assert(MAXWELL3D_REG_INDEX(tex_header) == 0x55D);
+static_assert(MAXWELL3D_REG_INDEX(tex_sampler) == 0x557);
+static_assert(MAXWELL3D_REG_INDEX(sampler_binding) == 0x48D);
+static_assert(MAXWELL3D_REG_INDEX(vertex_id_base) == 0x446);
+
 bool Maxwell3D::IsFastDrawParameter(u32 method) {
+    const auto& sw = VideoCommon::Nx2FastDraw::Sw();
+    switch (method) {
+    // EDEN_NX2_FD_QUERY: read by ProcessQueryGet and ProcessCounterReset (whose methods
+    // IsFastDrawNeutralMethod decides on) and by PrepareDraw's CounterEnable, which runs after
+    // Configure and ConfigureDelta alike.
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_high):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_low):
+    case MAXWELL3D_REG_INDEX(report_semaphore.payload):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(zpass_pixel_count_enable):
+        if (sw.query) {
+            return true;
+        }
+        break;
+    // EDEN_NX2_FD_COND: read by ProcessQueryCondition only.
+    case MAXWELL3D_REG_INDEX(render_enable.address_high):
+    case MAXWELL3D_REG_INDEX(render_enable.address_low):
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+    case MAXWELL3D_REG_INDEX(render_enable_override):
+        if (sw.cond) {
+            return true;
+        }
+        break;
+    // EDEN_NX2_FD_VERTEXID: no renderer code reads vertex_id_base (the pipeline key, descriptor
+    // resolve and buffer cache never name it; only the HLE draw macros write it, and directly).
+    // A macro that reads it back acts through other writes, which break or are noted themselves.
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
+        if (sw.vertex_id) {
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.size):
     case MAXWELL3D_REG_INDEX(const_buffer.address_high):
@@ -424,8 +474,50 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
     }
 }
 
+bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    const auto& sw = FastDraw::Sw();
+    using RS = Regs::ReportSemaphore;
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(report_semaphore.query): {
+        // EDEN_NX2_FD_QUERY: a ZPass (samples) report runs as before; only the serial bump goes.
+        // It records query cache state, and its result lands at the report address now or when
+        // a fence releases (that break stays): note those bytes as inline data, so a report into
+        // a handle buffer or the header tables still ends reuse. Payload and other reports,
+        // acquires and traps break as in v6.
+        const auto& query = regs.report_semaphore.query;
+        const RS::Operation operation = query.operation.Value();
+        if (!sw.query || query.report.Value() != RS::Report::ZPassPixelCount64 ||
+            (operation != RS::Operation::Release && operation != RS::Operation::ReportOnly)) {
+            return false;
+        }
+        if (!FastDraw::AlreadyBroken()) {
+            const GPUVAddr address = regs.report_semaphore.Address();
+            NoteFastDrawConstantData(address, address + 16);
+        }
+        return true;
+    }
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+        // EDEN_NX2_FD_QUERY: a samples counter reset changes query cache state only.
+        return sw.query && regs.clear_report_value == Regs::ClearReport::ZPassPixelCount;
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+        // EDEN_NX2_FD_COND: ProcessQueryCondition only decides whether later draws run.
+        return sw.cond;
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+        // EDEN_NX2_FD_BARRIER: deferred; ConfigureImpl and ConfigureDelta both end the render
+        // pass for it with the same views, and the next draw sees the new render pass serial.
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        // RasterizerVulkan::TiledCacheBarrier does nothing.
+        return sw.barrier;
+    default:
+        return false;
+    }
+}
+
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        VideoCommon::Nx2FastDraw::Enabled() && !VideoCommon::Nx2FastDraw::AlreadyBroken() &&
+        !IsFastDrawNeutralMethod(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
@@ -1030,6 +1122,9 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
 
 void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
+    if (FastDraw::AlreadyBroken()) {
+        return; // EDEN_NX2_FD_SHORT: the next draw resolves in full whatever this reaches
+    }
     // Texture and sampler headers are read when image views are resolved, which delta draws skip.
     constexpr u64 HeaderSize = 0x20;
     const GPUVAddr tic = regs.tex_header.Address();
