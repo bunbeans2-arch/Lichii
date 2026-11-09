@@ -213,6 +213,15 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
+    // LICHII_UNEVEN_BC=1 (probe only): no RGBA8 workaround, these go to BC1/BC3 like other ASTC.
+    // Shows the VRAM/churn win and what the AMD sampling fault looks like; not for user builds.
+    static const bool probe_bc = [] {
+        const char* value = std::getenv("LICHII_UNEVEN_BC");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (probe_bc) {
+        return false;
+    }
     return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
 }
 
