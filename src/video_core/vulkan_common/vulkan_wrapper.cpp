@@ -5,13 +5,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/thread.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -525,8 +532,322 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        if (recycle_key != 0 && allocation != nullptr &&
+            ImageRecycler::Put(recycle_key, allocator, handle, allocation)) {
+            return;
+        }
         vmaDestroyImage(allocator, handle, allocation);
     }
+}
+
+namespace {
+struct RecycledImage {
+    u64 key;
+    VmaAllocator allocator;
+    VkImage handle;
+    VmaAllocation allocation;
+    u64 size;
+    std::chrono::steady_clock::time_point kept;
+};
+
+struct RecyclerState {
+    std::mutex mutex;
+    std::vector<RecycledImage> images; // oldest first
+    u64 bytes = 0;
+    VmaAllocator closed{}; ///< Torn down: keeps nothing more of it
+    u64 takes = 0;  ///< Take calls that found an image, this log window
+    u64 misses = 0; ///< Take calls that found none (a new image was made)
+    std::chrono::steady_clock::time_point log_since = std::chrono::steady_clock::now();
+};
+
+RecyclerState& Recycler() {
+    static RecyclerState state;
+    return state;
+}
+
+/// What the recycler keeps at most (512 MiB, less on small cards: ImageRecycler::SetCap), and how
+/// long a kept image waits to be taken again.
+constexpr u64 MaxRecyclerCap = u64{512} << 20;
+std::atomic<u64> g_recycler_cap{MaxRecyclerCap};
+u64 RecyclerCap() noexcept {
+    return g_recycler_cap.load(std::memory_order_relaxed);
+}
+constexpr std::chrono::seconds RecycleKeepTime{10};
+
+/// Images dropped from the recycler are destroyed on a thread of their own: freeing dedicated
+/// memory is a kernel call (~0.2 ms), which the GPU thread would make otherwise.
+struct Graveyard {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<RecycledImage> images;
+    std::mutex destroy_mutex; ///< Held while a batch is destroyed (Clear waits for it)
+    bool started = false;
+};
+
+Graveyard& Reaper() {
+    // Never destroyed: its thread may still wait on it while the process exits.
+    static Graveyard* const graveyard = new Graveyard;
+    return *graveyard;
+}
+
+void ReaperLoop(Graveyard& graveyard) {
+    std::vector<RecycledImage> batch;
+    while (true) {
+        std::unique_lock destroy_lock{graveyard.destroy_mutex, std::defer_lock};
+        {
+            std::unique_lock lock{graveyard.mutex};
+            graveyard.cv.wait(lock, [&graveyard] { return !graveyard.images.empty(); });
+            // Taken with the batch, so Clear sees either the images or a batch in progress.
+            destroy_lock.lock();
+            batch.swap(graveyard.images);
+        }
+        for (const RecycledImage& image : batch) {
+            vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        }
+        batch.clear();
+    }
+}
+
+void Bury(std::vector<RecycledImage>&& images) {
+    Graveyard& graveyard = Reaper();
+    {
+        std::scoped_lock lock{graveyard.mutex};
+        if (!graveyard.started) {
+            graveyard.started = true;
+            std::thread{[&graveyard] {
+                Common::SetCurrentThreadName("VulkanReaper");
+                ReaperLoop(graveyard);
+            }}.detach();
+        }
+        graveyard.images.insert(graveyard.images.end(), images.begin(), images.end());
+    }
+    graveyard.cv.notify_one();
+}
+
+/// Drops kept images that are too old, or the oldest until `room` more bytes fit the cap.
+void TrimRecycler(RecyclerState& state, u64 room, std::chrono::steady_clock::time_point now) {
+    size_t drop = 0;
+    u64 bytes = state.bytes;
+    while (drop < state.images.size() &&
+           (now - state.images[drop].kept > RecycleKeepTime || bytes + room > RecyclerCap())) {
+        bytes -= state.images[drop].size;
+        ++drop;
+    }
+    if (drop == 0) {
+        return;
+    }
+    const auto first = state.images.begin();
+    const auto last = first + static_cast<std::ptrdiff_t>(drop);
+    Bury(std::vector<RecycledImage>(first, last));
+    state.images.erase(first, last);
+    state.bytes = bytes;
+}
+} // Anonymous namespace
+
+bool ImageRecycler::Enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_IMG_RECYCLE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+u64 ImageRecycler::KeyOf(const VkImageCreateInfo& ci, bool dedicated) noexcept {
+    if (!Enabled()) {
+        return 0;
+    }
+    constexpr u64 Mul = 0x100000001b3ULL;
+    u64 key = 0xcbf29ce484222325ULL;
+    const auto mix = [&key](u64 value) { key = (key ^ value) * Mul; };
+    mix(ci.flags);
+    mix(ci.imageType);
+    mix(ci.format);
+    mix((u64{ci.extent.width} << 32) | ci.extent.height);
+    mix(ci.extent.depth);
+    mix((u64{ci.mipLevels} << 32) | ci.arrayLayers);
+    mix(ci.samples);
+    mix(ci.tiling);
+    mix(ci.usage);
+    mix(ci.sharingMode);
+    mix(ci.initialLayout);
+    mix(dedicated ? 1 : 0);
+    if (ci.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        for (u32 index = 0; index < ci.queueFamilyIndexCount; ++index) {
+            mix(ci.pQueueFamilyIndices[index]);
+        }
+    }
+    for (auto* next = static_cast<const VkBaseInStructure*>(ci.pNext); next != nullptr;
+         next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            return 0;
+        }
+        const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+        mix(list->viewFormatCount);
+        for (u32 index = 0; index < list->viewFormatCount; ++index) {
+            mix(list->pViewFormats[index]);
+        }
+    }
+    return key == 0 ? 1 : key;
+}
+
+bool ImageRecycler::Put(u64 key, VmaAllocator allocator, VkImage handle,
+                        VmaAllocation allocation) noexcept {
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    if (info.size > RecyclerCap()) {
+        return false;
+    }
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    if (state.closed == allocator) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    TrimRecycler(state, info.size, now);
+    state.images.push_back({key, allocator, handle, allocation, info.size, now});
+    state.bytes += info.size;
+    return true;
+}
+
+bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
+                         VmaAllocation& allocation) noexcept {
+    if (key == 0) {
+        return false;
+    }
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    // Looked for before old images are dropped: after a few seconds without new images (the
+    // camera standing still), the first images of the next scene found theirs dropped just then.
+    bool found = false;
+    for (size_t index = state.images.size(); index-- > 0;) {
+        const RecycledImage& image = state.images[index];
+        if (image.key == key && image.allocator == allocator) {
+            handle = image.handle;
+            allocation = image.allocation;
+            state.bytes -= image.size;
+            state.images.erase(state.images.begin() + static_cast<std::ptrdiff_t>(index));
+            found = true;
+            break;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    ++(found ? state.takes : state.misses);
+    if (now - state.log_since >= std::chrono::seconds{10}) {
+        const double seconds = std::chrono::duration<double>(now - state.log_since).count();
+        LOG_INFO(Render_Vulkan,
+                 "Image recycler ({:.1f} s): {} taken ({:.0f}/s), {} made new ({:.0f}/s), {} kept "
+                 "({:.1f} MiB)",
+                 seconds, state.takes, state.takes / seconds, state.misses,
+                 state.misses / seconds, state.images.size(),
+                 static_cast<double>(state.bytes) / (1 << 20));
+        state.takes = 0;
+        state.misses = 0;
+        state.log_since = now;
+    }
+    TrimRecycler(state, 0, now);
+    return found;
+}
+
+u64 ImageRecycler::KeptBytes() noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    return state.bytes;
+}
+
+void ImageRecycler::Shrink(u64 bytes) noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    if (state.bytes <= bytes) {
+        return;
+    }
+    // Here bytes < kept bytes <= cap, except right after SetCap lowered the cap: then drop to
+    // nothing (room = cap). Dropping the oldest until `cap - bytes` more fit leaves at most
+    // `bytes`.
+    const u64 cap = RecyclerCap();
+    TrimRecycler(state, cap > bytes ? cap - bytes : cap, std::chrono::steady_clock::now());
+}
+
+void ImageRecycler::SetCap(u64 bytes) noexcept {
+    // At least 64 MiB, so a small heap report doesn't turn recycling off by accident.
+    g_recycler_cap.store((std::min)(MaxRecyclerCap, (std::max)(bytes, u64{64} << 20)),
+                         std::memory_order_relaxed);
+}
+
+u64 ImageRecycler::Purge(VmaAllocator allocator) noexcept {
+    if (!Enabled()) {
+        return 0;
+    }
+    // Same lock order as Clear (recycler, graveyard, destroy batch), but the allocator stays open.
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    u64 freed = 0;
+    std::erase_if(state.images, [&state, &freed, allocator](const RecycledImage& image) {
+        if (image.allocator != allocator) {
+            return false;
+        }
+        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        state.bytes -= image.size;
+        freed += image.size;
+        return true;
+    });
+    Graveyard& graveyard = Reaper();
+    std::scoped_lock graveyard_lock{graveyard.mutex};
+    std::erase_if(graveyard.images, [&freed, allocator](const RecycledImage& image) {
+        if (image.allocator != allocator) {
+            return false;
+        }
+        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        freed += image.size;
+        return true;
+    });
+    // A batch the reaper is destroying right now frees memory too: wait for it.
+    std::unique_lock destroy_lock{graveyard.destroy_mutex, std::try_to_lock};
+    if (!destroy_lock.owns_lock()) {
+        destroy_lock.lock();
+        freed = (std::max)(freed, u64{1});
+    }
+    if (freed != 0) {
+        static u32 logged{};
+        if (logged++ < 16) {
+            LOG_WARNING(Render_Vulkan, "Image recycler: out of device memory, gave back {:.1f} MiB",
+                        static_cast<double>(freed) / (1 << 20));
+        }
+    }
+    return freed;
+}
+
+void ImageRecycler::Open(VmaAllocator allocator) noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    if (state.closed == allocator) {
+        state.closed = nullptr;
+    }
+}
+
+void ImageRecycler::Clear(VmaAllocator allocator) noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    state.closed = allocator;
+    std::erase_if(state.images, [&state, allocator](const RecycledImage& image) {
+        if (image.allocator != allocator) {
+            return false;
+        }
+        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        state.bytes -= image.size;
+        return true;
+    });
+    // And the dropped ones the reaper has not destroyed yet, before the allocator goes.
+    Graveyard& graveyard = Reaper();
+    std::scoped_lock graveyard_lock{graveyard.mutex};
+    std::erase_if(graveyard.images, [allocator](const RecycledImage& image) {
+        if (image.allocator != allocator) {
+            return false;
+        }
+        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        return true;
+    });
+    // A batch being destroyed: wait for it.
+    std::scoped_lock destroy_lock{graveyard.destroy_mutex};
 }
 
 Image::MemoryBlock Image::GetMemoryBlock() const noexcept {

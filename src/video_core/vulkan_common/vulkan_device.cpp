@@ -798,12 +798,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // Synchronized inside VMA: the image recycler destroys dropped images on a thread of its own
+    // while the GPU thread allocates (vulkan_wrapper.cpp). LICHII_IMG_RECYCLE=0: as before.
+    VmaAllocatorCreateFlags flags = vk::ImageRecycler::Enabled()
+                                        ? VmaAllocatorCreateFlags{0}
+                                        : VmaAllocatorCreateFlags{
+                                              VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT};
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
+    if (extensions.memory_priority) {
+        flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
     }
     // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
@@ -838,6 +846,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     };
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    vk::ImageRecycler::Open(allocator);
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -854,6 +863,8 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // Recycled images may hold memory from a separate pool (MediumImages): free them first.
+    vk::ImageRecycler::Clear(allocator);
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
             if (pool != VK_NULL_HANDLE) {
@@ -871,10 +882,14 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::MediumImages ? MediumImagePoolBlockSize
+                                                            : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
-            .priority = 0.f,
+            // Guest buffers are read by most draws; sparse pages are textures (VMA's default).
+            .priority = !vk::ImageRecycler::Enabled()              ? 0.f
+                        : kind == SeparatePool::DeviceBuffers ? 0.75f
+                                                              : 0.5f,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
         };
@@ -1829,6 +1844,21 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance4 = features.maintenance4.maintenance4;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance4, features.maintenance4,
                                        VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+
+    // VK_EXT_memory_priority, VK_EXT_pageable_device_local_memory: under memory pressure the
+    // driver moves the lowest-priority allocations to system memory instead of failing new ones
+    // (Windows pages device memory either way; this tells it what to keep).
+    // LICHII_IMG_RECYCLE=0: neither extension is enabled (the base's device).
+    extensions.memory_priority =
+        features.memory_priority.memoryPriority && vk::ImageRecycler::Enabled();
+    RemoveExtensionFeatureIfUnsuitable(extensions.memory_priority, features.memory_priority,
+                                       VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    extensions.pageable_device_local_memory =
+        features.pageable_device_local_memory.pageableDeviceLocalMemory &&
+        extensions.memory_priority;
+    RemoveExtensionFeatureIfUnsuitable(extensions.pageable_device_local_memory,
+                                       features.pageable_device_local_memory,
+                                       VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
 
     // VK_KHR_maintenance5
     extensions.maintenance5 = features.maintenance5.maintenance5;

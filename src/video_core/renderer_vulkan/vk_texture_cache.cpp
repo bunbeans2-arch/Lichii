@@ -49,6 +49,7 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/textures/decoders.h"
@@ -537,7 +538,12 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+    const float priority = info.render_target ? MemoryAllocator::RenderTargetPriority
+                                              : MemoryAllocator::ImagePriority;
+    // Recyclable: these images (original, scaled, null) are destroyed only with their texture
+    // cache Image, which DeleteImage frees once the GPU is past CurrentTick (or never used).
+    return may_fail ? allocator.TryCreateImage(image_ci, false, priority, true)
+                    : allocator.CreateImage(image_ci, false, priority, true);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2798,6 +2804,14 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
     return device.GetDeviceMemoryUsage();
 }
 
+u64 TextureCacheRuntime::GetRecycledImageMemory() const {
+    return vk::ImageRecycler::KeptBytes();
+}
+
+void TextureCacheRuntime::ShrinkRecycledImages(u64 bytes) {
+    vk::ImageRecycler::Shrink(bytes);
+}
+
 u64 TextureCacheRuntime::CurrentTick() const noexcept {
     return scheduler.CurrentTick();
 }
@@ -2972,7 +2986,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;
-        } else if (texels <= (u64{1} << 28)) {
+        } else if (texels <= MaxBackedImageTexels) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
             // was written there yet, so the first write gets it replaced.
             flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;

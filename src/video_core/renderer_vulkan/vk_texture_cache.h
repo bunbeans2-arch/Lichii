@@ -101,6 +101,11 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    /// Device memory the image recycler keeps (vk::ImageRecycler): the collector counts it as
+    /// free, and when memory runs short the recycler gives it back first.
+    u64 GetRecycledImageMemory() const;
+    void ShrinkRecycledImages(u64 bytes);
+
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
@@ -483,6 +488,14 @@ public:
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
         return !original_image && info.type != VideoCommon::ImageType::Buffer;
+    }
+
+    /// Destroyed now rather than after the GPU's last use (DeleteImage's immediate path): its
+    /// images must not go to vk::ImageRecycler, where a new image could take them while the
+    /// GPU still reads them.
+    void KeepOutOfRecycler() noexcept {
+        original_image.SetRecycleKey(0);
+        scaled_image.SetRecycleKey(0);
     }
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,

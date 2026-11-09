@@ -106,12 +106,23 @@ namespace Vulkan {
 
         MemoryAllocator(const MemoryAllocator &) = delete;
 
+        /// Residency priority of render targets and presented frames (VK_EXT_memory_priority).
+        static constexpr float RenderTargetPriority = 1.0f;
+        /// Residency priority of other images, VMA's and Vulkan's default.
+        static constexpr float ImagePriority = 0.5f;
+
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// `priority`: residency priority of the image's dedicated memory (VK_EXT_memory_priority).
+        /// `recyclable`: the image may come from, and goes back to, vk::ImageRecycler. Only for
+        /// owners that destroy the image after the GPU's last use of it (the texture cache's
+        /// images: DeleteImage waits for the tick); everyone else keeps plain create/destroy.
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              float priority = ImagePriority, bool recyclable = false) const;
 
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
-        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                                 float priority = ImagePriority, bool recyclable = false) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -172,8 +183,17 @@ namespace Vulkan {
             }
         }
 
+        /// An image of over half a default block and up to a quarter of a medium image pool
+        /// block, placed in that pool (Device::SeparatePool::MediumImages). False leaves it to
+        /// the default blocks.
+        bool AllocateMediumImage(const VkImageCreateInfo &ci, VkImage &handle,
+                                 VmaAllocation &allocation) const;
+
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
+        /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, float priority,
+                               bool may_fail, bool recyclable,
+                               vk::Image &image) const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.

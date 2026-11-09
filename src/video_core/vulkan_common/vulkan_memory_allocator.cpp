@@ -18,7 +18,9 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include <cstdlib>
 #include <ranges>
+#include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -72,6 +74,50 @@ namespace {
                 return {};
         }
         return {};
+    }
+
+    // VK_EXT_memory_priority: what the driver keeps resident first when device memory runs short.
+    // Stream buffers are rewritten every frame, guest buffers are read by most draws; staging
+    // lives in host memory and goes first.
+    [[nodiscard]] float MemoryUsagePriority(MemoryUsage usage) {
+        if (!vk::ImageRecycler::Enabled()) {
+            return 0.0f; // LICHII_IMG_RECYCLE=0: the base's priority
+        }
+        switch (usage) {
+            case MemoryUsage::Stream:
+                return 1.0f;
+            case MemoryUsage::DeviceLocal:
+                return 0.75f;
+            case MemoryUsage::Upload:
+            case MemoryUsage::Download:
+                return 0.0f;
+        }
+        return 0.5f;
+    }
+
+    [[nodiscard]] VmaAllocationCreateInfo WithoutBudgetLimit(VmaAllocationCreateInfo ci) {
+        ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        return ci;
+    }
+
+    /// A buffer that missed device memory: give the recycler's kept images back first and retry
+    /// as asked, then retry past the budget (ee7617f6). LICHII_IMG_RECYCLE=0: no retries (base).
+    template <typename Create>
+    [[nodiscard]] VkResult RetryBufferOutOfMemory(VkResult result, VmaAllocator allocator,
+                                                  const VmaAllocationCreateInfo &alloc_ci,
+                                                  Create &&create) {
+        if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY || !vk::ImageRecycler::Enabled()) {
+            return result;
+        }
+        if (vk::ImageRecycler::Purge(allocator) != 0) {
+            result = create(alloc_ci);
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // Over the budget: past it the driver pages the lowest-priority memory out
+            // (VK_EXT_pageable_device_local_memory) instead of the buffer failing.
+            result = create(WithoutBudgetLimit(alloc_ci));
+        }
+        return result;
     }
 
     [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryUsage usage) {
@@ -187,6 +233,16 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
             properties{device_.GetPhysical().GetMemoryProperties().memoryProperties},
             buffer_image_granularity{
                     device_.GetPhysical().GetProperties().limits.bufferImageGranularity} {
+    // The recycler keeps at most a sixteenth of the largest device-local heap (and 512 MiB).
+    {
+        u64 device_local = 0;
+        for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+            if ((properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                device_local = (std::max)(device_local, u64{properties.memoryHeaps[heap].size});
+            }
+        }
+        vk::ImageRecycler::SetCap(device_local / 16);
+    }
 
     // Preserve the previous "RenderDoc small heap" trimming behavior that we had in original vma minus the heap bug
     if (device.HasDebuggingToolAttached())
@@ -206,23 +262,160 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       float priority, bool recyclable) const
 {
     vk::Image image;
-    vk::Check(AllocateImage(ci, dedicated, image));
+    vk::Check(AllocateImage(ci, dedicated, priority, false, recyclable, image));
     return image;
 }
 
-vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
+vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                          float priority, bool recyclable) const {
     vk::Image image;
-    const VkResult result = AllocateImage(ci, dedicated, image);
+    // EDEN_NX2_IMAGE_MAY_FAIL=1 (0c7d0c0e): a texture cache image with no memory left fails and
+    // is left out (it renders missing) instead of getting an unbacked image. Off by default here
+    // (H12 review: an image risk under VRAM pressure), and off with LICHII_IMG_RECYCLE=0.
+    static const bool may_fail = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_MAY_FAIL");
+        return value != nullptr && value[0] == '1' && vk::ImageRecycler::Enabled();
+    }();
+    const VkResult result = AllocateImage(ci, dedicated, priority, may_fail, recyclable, image);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
     return image;
 }
 
+namespace {
+/// EDEN_NX2_MEDIUM_IMAGE_POOL=0 (or LICHII_IMG_RECYCLE=0): images of 8-64 MiB get memory of their
+/// own again (Lichii #922).
+bool MediumImagePoolEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MEDIUM_IMAGE_POOL");
+        return (value == nullptr || value[0] != '0') && vk::ImageRecycler::Enabled();
+    }();
+    return enabled;
+}
+
+/// Bytes per texel of common host formats, in quarters (BC1/BC4: 2 = half a byte); 0 = unknown.
+u32 QuarterBytesPerTexel(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_UINT:
+        return 4;
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_D16_UNORM:
+        return 8;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+        return 16;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return 32;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+        return 64;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+        return 2;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+/// False only when the image surely falls outside the medium pool's window (over half a default
+/// block, up to a quarter of a medium block), so AllocateMediumImage need not create it just to
+/// read its size. Generous bounds: mips add under half, padding and alignment a quarter plus
+/// 1 MiB. Unknown formats are always tried (the exact check stays in AllocateMediumImage).
+bool MayFitMediumPool(const VkImageCreateInfo &ci, u64 texels) {
+    const u32 quarters = QuarterBytesPerTexel(ci.format);
+    if (quarters == 0) {
+        return true;
+    }
+    const u64 samples = static_cast<u64>(ci.samples);
+    const u64 low = texels * quarters * samples / 4;
+    const u64 high = (ci.mipLevels > 1 ? low * 3 / 2 : low) * 5 / 4 + (u64{1} << 20);
+    return high > Device::SeparatePoolBlockSize / 2 && low <= Device::MediumImagePoolBlockSize / 4;
+}
+} // namespace
+
+bool MemoryAllocator::AllocateMediumImage(const VkImageCreateInfo &ci, VkImage &handle,
+                                          VmaAllocation &allocation) const {
+    // Over half a default block (8 MiB), VMA gives an image memory of its own: one driver
+    // allocation (vkAllocateMemory) per image. Ocarina of Time creates and frees render targets
+    // and textures of that size while the player runs, and those allocations took ~5% of the
+    // GPU back thread there.
+    const auto &dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    VkImage raw{};
+    if (dld.vkCreateImage(logical, &ci, nullptr, &raw) != VK_SUCCESS) {
+        return false;
+    }
+    const auto discard = [&] {
+        dld.vkDestroyImage(logical, raw, nullptr);
+        return false;
+    };
+    VkMemoryRequirements requirements{};
+    dld.vkGetImageMemoryRequirements(logical, raw, &requirements);
+    if (requirements.size <= Device::SeparatePoolBlockSize / 2 ||
+        requirements.size > Device::MediumImagePoolBlockSize / 4) {
+        return discard();
+    }
+    VmaAllocationCreateInfo type_ci{};
+    type_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    u32 memory_type = 0;
+    if (vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &type_ci, &memory_type) !=
+        VK_SUCCESS) {
+        return discard();
+    }
+    const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::MediumImages, memory_type);
+    if (pool == VK_NULL_HANDLE) {
+        return discard();
+    }
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.flags =
+        VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT;
+    alloc_ci.pool = pool;
+    if (vmaAllocateMemoryForImage(allocator, raw, &alloc_ci, &allocation, nullptr) != VK_SUCCESS) {
+        return discard();
+    }
+    if (vmaBindImageMemory(allocator, allocation, raw) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, allocation);
+        return discard();
+    }
+    handle = raw;
+    return true;
+}
+
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                        float priority, bool may_fail, bool recyclable,
                                         vk::Image &image) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
@@ -237,19 +430,39 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
-            .priority = 0.f,
+            // Applies to dedicated memory (images over half a block, or asked for); the shared
+            // blocks keep VMA's default of 0.5. LICHII_IMG_RECYCLE=0: the base's 0.
+            .priority = vk::ImageRecycler::Enabled() ? priority : 0.f,
     };
 
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
-    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
-    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
-    // unbacked sparse fallback below.
+    // An image of the same create info released before is taken from the recycler instead
+    // (vk::ImageRecycler). Only recyclable callers (LICHII_IMG_RECYCLE=0: none).
+    const u64 recycle_key = recyclable ? vk::ImageRecycler::KeyOf(ci, dedicated) : 0;
+    if (recycle_key != 0 && vk::ImageRecycler::Take(recycle_key, allocator, handle, allocation)) {
+        image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                          device.GetDispatchLoader());
+        image.SetRecycleKey(recycle_key);
+        return VK_SUCCESS;
+    }
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    const bool huge = texels > (u64{1} << 28);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    const bool huge = texels > MaxBackedImageTexels;
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!dedicated && !huge && texels >= (u64{1} << 20) && MediumImagePoolEnabled() &&
+        MayFitMediumPool(ci, texels) && AllocateMediumImage(ci, handle, allocation)) {
+        vmaGetAllocationInfo(allocator, allocation, &alloc_info);
+        result = VK_SUCCESS;
+    } else if (!huge) {
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge &&
+        vk::ImageRecycler::Purge(allocator) != 0) {
+        // The recycler's kept images count as VMA usage (the collector counts them as free):
+        // give them all back at once, then try again within the budget.
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -283,13 +496,15 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
-        if (!huge) {
-            pressure_events.fetch_add(1, std::memory_order_relaxed);
-        }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        pressure_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
+        UsesUnbackedFallback(texels, may_fail)) {
         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
-        // nothing bound, so views and copies still work, instead of aborting.
+        // nothing bound, so views and copies still work, instead of aborting. A smaller image
+        // gets one only for a caller that would throw otherwise.
         if (vk::Image sparse = CreateUnbackedImage(ci)) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
@@ -323,6 +538,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
 
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
+    // Images placed in host memory under memory pressure are freed rather than kept.
+    if (recycle_key != 0 && alloc_info.memoryType < properties.memoryTypeCount &&
+        (properties.memoryTypes[alloc_info.memoryType].propertyFlags &
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        image.SetRecycleKey(recycle_key);
+    }
     return VK_SUCCESS;
 }
 
@@ -355,7 +576,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         .memoryTypeBits = requirements.memoryTypeBits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = vk::ImageRecycler::Enabled() ? 0.5f : 0.f,
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
@@ -437,7 +658,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = usage == MemoryUsage::Stream ? 0u : valid_memory_types,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = MemoryUsagePriority(usage),
     };
 
     VkBuffer handle{};
@@ -446,7 +667,14 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation,
+                                          &alloc_info);
+        result = RetryBufferOutOfMemory(
+            result, allocator, alloc_ci, [&](const VmaAllocationCreateInfo &retry_ci) {
+                return vmaCreateBuffer(allocator, &ci, &retry_ci, &handle, &allocation,
+                                       &alloc_info);
+            });
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -495,7 +723,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = memory_type_bits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = MemoryUsagePriority(usage),
     };
 
     VkBuffer handle{};
@@ -503,8 +731,14 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    VkResult result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment,
+                                                   &handle, &allocation, &alloc_info);
+    result = RetryBufferOutOfMemory(
+        result, allocator, alloc_ci, [&](const VmaAllocationCreateInfo &retry_ci) {
+            return vmaCreateBufferWithAlignment(allocator, &ci, &retry_ci, min_alignment, &handle,
+                                                &allocation, &alloc_info);
+        });
+    vk::Check(result);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -532,6 +766,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
     ci.requiredFlags = 0;
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
+    ci.priority = MemoryUsagePriority(usage);
 
     VmaAllocation a{};
     VmaAllocationInfo info{};
@@ -567,7 +802,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
     ci.pool = VK_NULL_HANDLE;
     ci.pUserData = nullptr;
-    ci.priority = 0.0f;
+    ci.priority = MemoryUsagePriority(usage);
 
     const VkBuffer raw = *buffer;
 
