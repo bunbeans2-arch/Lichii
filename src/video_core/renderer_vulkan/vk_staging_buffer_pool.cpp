@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -290,8 +291,24 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
 
-    const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
+    // A free buffer is kept until it has sat unused for LICHII_STAGING_KEEP_TICKS submits (default
+    // 4096), so a camera turn's upload burst finds warm buffers instead of allocating new ones.
+    // LICHII_ASTCBATCH=0 restores deleting any free buffer.
+    static const u64 keep_ticks = [] {
+        const char* off = std::getenv("LICHII_ASTCBATCH");
+        if (off && off[0] == '0') {
+            return u64{0};
+        }
+        const char* value = std::getenv("LICHII_STAGING_KEEP_TICKS");
+        return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} : u64{4096};
+    }();
+    const u64 current_tick = scheduler.CurrentTick();
+    // Upload memory can be device-local (ReBAR), and OoT's forest fills VRAM when textures are
+    // kept: a level holding more than 64 MiB of buffers deletes free ones as before.
+    const bool keep_warm = (u64{entries.size()} << log2) <= (u64{64} << 20);
+    const auto is_deletable = [this, current_tick, keep_warm](const StagingBuffer& entry) {
+        return scheduler.IsFree(entry.tick) &&
+               (!keep_warm || current_tick - entry.tick >= keep_ticks);
     };
     const size_t begin_offset = staging.delete_index;
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);

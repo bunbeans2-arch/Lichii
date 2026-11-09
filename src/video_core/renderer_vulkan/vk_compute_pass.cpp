@@ -811,11 +811,33 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     if (!target.wait) {
         return;
     }
+    // LICHII_ASTCBATCH=0 submits after every decode as before. Otherwise decodes of a turn's
+    // texture burst share submits: the same commands in the same order on the same queue, with
+    // a submit once LICHII_ASTC_FLUSH_MIB (default 32) of input has queued, and always for
+    // trimmed-level or many-layer images (long dispatches).
+    static const bool batch = [] {
+        const char* value = std::getenv("LICHII_ASTCBATCH");
+        return !(value && value[0] == '0');
+    }();
+    static const size_t batch_limit = [] {
+        const char* value = std::getenv("LICHII_ASTC_FLUSH_MIB");
+        const unsigned long long mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 32ULL;
+        return static_cast<size_t>((std::max)(mib, 1ULL)) << 20;
+    }();
+    static size_t batched_bytes{};
+    static u32 submits{};
+    batched_bytes += input_size;
+    const bool submit_now = !flush_only || !batch || skip != 0 || info.resources.layers > 16 ||
+                            batched_bytes >= batch_limit;
     const auto start = std::chrono::steady_clock::now();
-    if (flush_only) {
-        scheduler.Flush();
-    } else {
-        scheduler.Finish();
+    if (submit_now) {
+        if (flush_only) {
+            scheduler.Flush();
+        } else {
+            scheduler.Finish();
+        }
+        batched_bytes = 0;
+        ++submits;
     }
     const auto end = std::chrono::steady_clock::now();
     static u32 decodes{};
@@ -824,11 +846,13 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     ++decodes;
     waited += end - start;
     if (end - window_start >= std::chrono::seconds{5}) {
-        LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,
+        LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({}), {} submits",
+                 decodes,
                  std::chrono::duration_cast<std::chrono::milliseconds>(end - window_start).count(),
                  std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
-                 flush_only ? "flush" : "finish");
+                 flush_only ? "flush" : "finish", submits);
         decodes = 0;
+        submits = 0;
         waited = {};
         window_start = end;
     }

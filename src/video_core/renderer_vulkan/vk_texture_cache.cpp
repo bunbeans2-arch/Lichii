@@ -2886,7 +2886,13 @@ void TextureCacheRuntime::TickFrame() {
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
     }
-    static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+    // Decode scratch images wait this long for the next texture of their shape (the 256 MiB cap
+    // below still bounds them): 1800 frames covers a camera turn away and back. LICHII_ASTCBATCH=0
+    // restores 60.
+    static const u32 MAX_UNUSED_SCRATCH_FRAMES = [] {
+        const char* value = std::getenv("LICHII_ASTCBATCH");
+        return value && value[0] == '0' ? 60U : 1800U;
+    }();
     // Finished decode images wait for the next texture of their shape, up to this much memory.
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     const auto decode_bytes = [](const PendingTranscode& t) {
