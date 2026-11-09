@@ -535,6 +535,41 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
         LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
     }
 }
+
+// CPU sets are a soft preference (Microsoft, "CPU Sets"): selecting a core for the front and the
+// back does not keep the process's other threads off it. Making every other logical processor the
+// process default moves the threads without CPU sets of their own (Vulkan worker, fencing, present,
+// audio, driver threads) off the two GPU cores, so no SMT sibling shares them. Threads that select
+// their own CPU sets keep them. Opt-in: EDEN_NX2_PIN_RESERVE=1 turns it on (pinning must be on too).
+void ReserveGpuCores(const std::vector<ULONG>& front, const std::vector<ULONG>& back) {
+    if (const char* text = std::getenv("EDEN_NX2_PIN_RESERVE"); text == nullptr || text[0] != '1') {
+        LOG_INFO(Common, "GPU core reservation off (set EDEN_NX2_PIN_RESERVE=1 to keep other threads "
+                         "off the GPU cores)");
+        return;
+    }
+    using PFN_SetProcessDefaultCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    static const auto set = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessDefaultCpuSets")));
+    if (set == nullptr) {
+        return;
+    }
+    std::vector<ULONG> others;
+    for (const Common::LogicalProcessor& processor : CpuSets().processors) {
+        if (std::ranges::find(front, processor.id) == front.end() &&
+            std::ranges::find(back, processor.id) == back.end()) {
+            others.push_back(processor.id);
+        }
+    }
+    if (others.empty()) {
+        return;
+    }
+    if (!set(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()))) {
+        LOG_WARNING(Common, "SetProcessDefaultCpuSets failed: {}", Common::GetLastErrorMsg());
+        return;
+    }
+    LOG_INFO(Common, "GPU cores reserved: the other {} logical processors are the process default",
+             others.size());
+}
 } // Anonymous namespace
 #endif
 
@@ -713,9 +748,11 @@ void PinCurrentThread(PinnedRole role) {
                  "GPU thread pinning: front and back on a physical core each, guest cores on the "
                  "other {} performance cores ({} logical processors)",
                  plan.performance_cores - 2, plan.guest.size());
-        return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
+        PinnedCpuSets result{{plan.front.begin(), plan.front.end()},
                              {plan.back.begin(), plan.back.end()},
                              {plan.guest.begin(), plan.guest.end()}};
+        ReserveGpuCores(result.front, result.back);
+        return result;
     }();
     const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
                                     : role == PinnedRole::GpuBack ? pinned.back
