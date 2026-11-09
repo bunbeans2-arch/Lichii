@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -53,6 +54,10 @@ static_assert(Nx2GpuAddressSpaceSize == (1ULL << 40));
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
 
+/// EDEN_NX2_CMDPAGE_DIAG: called for each page Nx2MarkGpuWritten marks for the first time (page
+/// index = device address >> Nx2WrittenPageBits). Null unless the diagnostic is on.
+inline std::atomic<void (*)(u64)> g_nx2_first_mark_hook{nullptr};
+
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return;
@@ -65,7 +70,12 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
         const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
         auto& word = g_nx2_gpu_written_pages[page / 64];
         if ((word.load(std::memory_order_relaxed) & mask) != mask) {
-            word.fetch_or(mask, std::memory_order_relaxed);
+            const u64 old = word.fetch_or(mask, std::memory_order_relaxed);
+            if (const auto hook = g_nx2_first_mark_hook.load(std::memory_order_relaxed)) {
+                for (u64 fresh = mask & ~old; fresh != 0; fresh &= fresh - 1) {
+                    hook((page / 64) * 64 + static_cast<u64>(std::countr_zero(fresh)));
+                }
+            }
         }
         page += bits;
     }

@@ -171,8 +171,15 @@ public:
     void Drain(DrainSite site = DrainSite::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter() {
+    void NoteWriter(bool compute = false) {
         last_writer_position = write_position;
+        if (compute) {
+            last_compute_writer_position = write_position;
+        }
+    }
+    /// EDEN_NX2_CMDPAGE_DIAG: where the last compute (not copy) writer was sent.
+    [[nodiscard]] u64 ComputeWriterPosition() const {
+        return last_compute_writer_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
@@ -210,6 +217,10 @@ public:
     [[nodiscard]] u64 Consumed() {
         consumed_cache = consumed.load(std::memory_order_acquire);
         return consumed_cache;
+    }
+    /// As Consumed, for any thread (leaves the front's cache alone). Diagnostics only.
+    [[nodiscard]] u64 ConsumedAnyThread() const {
+        return consumed.load(std::memory_order_acquire);
     }
     /// Waits until the back executed everything sent before `target`.
     void WaitForPosition(u64 target, DrainSite site) {
@@ -333,6 +344,7 @@ private:
     // the back thread in a sampled profile).
     alignas(64) u64 write_position{};
     u64 last_writer_position{};
+    u64 last_compute_writer_position{};
     u64 last_barrier_position{};
     u32 last_barrier_source{};
     // Queued tracked writes: the ring position after the last write to each 64-byte block.

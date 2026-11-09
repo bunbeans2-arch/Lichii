@@ -247,6 +247,23 @@ bool DmaPusher::Step() {
         }
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
             (!skip_list_wait || seen_gpu_written.load(std::memory_order_relaxed))) {
+            if (Nx2CmdPageDiag::g_enabled) {
+                // Which writers the wait below is for, and which pages this list is read from.
+                auto& split = VideoCommon::GpuSplit::Get();
+                const u64 back_at = split.Consumed();
+                const u64 front_at = split.Position();
+                Nx2CmdPageDiag::CountWriterQueue(
+                    back_at < (std::min)(split.ComputeWriterPosition(), front_at),
+                    back_at < (std::min)(split.WriterPosition(), front_at));
+                const GPUVAddr begin = dma_state.dma_get;
+                const GPUVAddr end = begin + u64{header.size} * sizeof(u32);
+                for (GPUVAddr page = begin & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+                    if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                        Nx2CmdPageDiag::NoteListRead(*device >> Tegra::Nx2WrittenPageBits,
+                                                     front_at);
+                    }
+                }
+            }
             const bool blocked = VideoCommon::GpuSplit::Get().WaitForWriters();
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -533,7 +550,7 @@ void DmaPusher::CallMethod(u32 argument) {
                                       engine_type != Engines::EngineTypes::MaxwellDMA;
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(engine_type == Engines::EngineTypes::KeplerCompute);
             } else if (untracked_writes) {
                 split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
                                         (dma_state.method & 0xfff));
@@ -604,7 +621,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                                       engine_type != Engines::EngineTypes::MaxwellDMA;
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(engine_type == Engines::EngineTypes::KeplerCompute);
             } else if (untracked_writes) {
                 split.NoteMemoryBarrier(0x20000 | (static_cast<u32>(engine_type) << 12) |
                                         (dma_state.method & 0xfff));

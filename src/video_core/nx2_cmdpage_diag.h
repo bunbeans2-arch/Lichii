@@ -17,6 +17,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 
 // EDEN_NX2_CMDPAGE_DIAG: for command list pages that GPU work writes (nx2.h), whether the work
@@ -91,6 +92,12 @@ struct State {
     std::atomic<u64> writer_checks{};  ///< Entries not known GPU-written: the front waits for writers
     std::atomic<u64> writer_blocked{}; ///< Of those, waits that found writers still queued
     std::atomic<u64> writer_flipped{}; ///< Of those, entries GPU-written once the writers ran
+    std::atomic<u64> writer_blocked_compute{}; ///< Blocked waits with a compute writer still queued
+    std::atomic<u64> writer_blocked_copy{};    ///< Blocked waits with only copy writers queued
+    std::atomic<u64> first_marks{};      ///< Pages GPU-written for the first time
+    std::atomic<u64> first_marks_list{}; ///< Of those, pages the front had read a list from
+    std::atomic<u64> first_marks_risk{}; ///< Of those, read after the back's position then
+    std::atomic<u32> first_marks_logged{};
     std::atomic<u64> dma_reads_gpu_pages{};
     std::atomic<u64> dma_reads_changed{};
     std::atomic<u64> dma_reads_changed_gpu_pages{};
@@ -106,6 +113,70 @@ inline State& Get() {
 
 inline u64 Take(std::atomic<u64>& counter) {
     return counter.exchange(0, std::memory_order_relaxed);
+}
+
+/// The front's last command list read of a page: the page index + 1 (0 = empty) and the split's
+/// write position then. Direct-mapped by page index; a collision forgets the older page.
+struct ListRead {
+    std::atomic<u64> tag{};
+    std::atomic<u64> position{};
+};
+inline constexpr size_t ListReadSlots = size_t{1} << 16;
+
+inline std::array<ListRead, ListReadSlots>& ListReads() {
+    static std::array<ListRead, ListReadSlots> slots{};
+    return slots;
+}
+
+/// The back (Nx2MarkGpuWritten): `page` is GPU-written for the first time. A list the front read
+/// from it after the back's current position would have been read before this write ran, had
+/// the front not waited for the writers (LICHII_LIST_WRITER_WAIT=0): an at-risk read.
+inline void OnFirstMark(u64 page) {
+    State& state = Get();
+    state.first_marks.fetch_add(1, std::memory_order_relaxed);
+    const ListRead& slot = ListReads()[page % ListReadSlots];
+    if (slot.tag.load(std::memory_order_relaxed) != page + 1) {
+        return;
+    }
+    state.first_marks_list.fetch_add(1, std::memory_order_relaxed);
+    const u64 read_at = slot.position.load(std::memory_order_relaxed);
+    const u64 back_at = VideoCommon::GpuSplit::Get().ConsumedAnyThread();
+    const bool risk = read_at > back_at;
+    state.first_marks_risk.fetch_add(risk ? 1 : 0, std::memory_order_relaxed);
+    if (state.first_marks_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_INFO(HW_GPU,
+                 "cmdpage diag: list page {:#x} GPU-written for the first time; front read it at "
+                 "split position {}, back at {} ({})",
+                 page << Nx2WrittenPageBits, read_at, back_at,
+                 risk ? "AT RISK without the writer wait" : "read before the writer was sent");
+    }
+}
+
+/// The front reads a command list from device page `page` (index) at split position `position`.
+inline void NoteListRead(u64 page, u64 position) {
+    if (!g_enabled) {
+        return;
+    }
+    [[maybe_unused]] static const bool hooked = [] {
+        Tegra::g_nx2_first_mark_hook.store(&OnFirstMark, std::memory_order_relaxed);
+        return true;
+    }();
+    ListRead& slot = ListReads()[page % ListReadSlots];
+    slot.position.store(position, std::memory_order_relaxed);
+    slot.tag.store(page + 1, std::memory_order_relaxed);
+}
+
+/// The front is about to wait for the writers: which kinds are still queued.
+inline void CountWriterQueue(bool compute_queued, bool copy_queued) {
+    if (!g_enabled) {
+        return;
+    }
+    State& state = Get();
+    if (compute_queued) {
+        state.writer_blocked_compute.fetch_add(1, std::memory_order_relaxed);
+    } else if (copy_queued) {
+        state.writer_blocked_copy.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 /// The back: GPU work wrote [device_addr, device_addr + size) over the list page at page_addr.
@@ -256,7 +327,8 @@ inline void Log() {
              "on entry {} elsewhere {} | list page writes draw {} (whole page {}) dispatch/copy "
              "{}; draw-written list pages {} | macro DMA reads {} (on GPU-written pages {}), "
              "changed by the drain {} (on GPU-written pages {}) | writer checks {} blocked {} "
-             "found written {}",
+             "found written {} | blocked with compute queued {}, copies only {} | first GPU "
+             "writes: pages {}, list pages {}, at risk {}",
              seconds, path(Path::Submitted), path(Path::Safe), path(Path::Copy), path(Path::Slow),
              Take(state.slow_drained), Take(state.slow_flushed),
              static_cast<double>(Take(state.slow_ns)) / 1e6, kind_names[0], kinds[0], changed[0],
@@ -269,7 +341,9 @@ inline void Log() {
              Take(state.draw_writes_whole_page), Take(state.other_writes), draw_pages,
              Take(state.dma_reads), Take(state.dma_reads_gpu_pages), Take(state.dma_reads_changed),
              Take(state.dma_reads_changed_gpu_pages), Take(state.writer_checks),
-             Take(state.writer_blocked), Take(state.writer_flipped));
+             Take(state.writer_blocked), Take(state.writer_flipped),
+             Take(state.writer_blocked_compute), Take(state.writer_blocked_copy),
+             Take(state.first_marks), Take(state.first_marks_list), Take(state.first_marks_risk));
 }
 
 /// The front waited for the writers before an entry not known to be GPU-written.
