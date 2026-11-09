@@ -710,11 +710,45 @@ void TextureCache<P>::TickFrame() {
         size_t images{};
         std::vector<std::pair<u64, const Image*>> largest;
         std::map<u32, std::pair<u64, u32>> by_format;
+        // LICHII_TC_HASHLOG=1 also counts each image's real allocation (its memory block, plus the
+        // scaled copy's estimate) and splits out ASTC kept as RGBA8, and prints the lists below at
+        // Info level.
+        const bool honest = HashLogEnabled();
+        u64 real_bytes{};
+        u64 astc_bytes{};
+        u64 astc_rgba8_bytes{};
+        size_t astc_rgba8{};
         for (const auto [image_id, image] : slot_images) {
-            const u64 bytes = GetScaledImageSizeBytes(*image);
+            u64 bytes = GetScaledImageSizeBytes(*image);
             image_bytes += bytes;
             ++images;
-            if (debug_stats) {
+            if (honest) {
+                u64 real = ImageMemoryBytes(*image);
+                if constexpr (requires(const Image& probe) { probe.MemoryBlock(); }) {
+                    const auto block = image->MemoryBlock();
+                    if (block.size != 0) {
+                        real = block.size;
+                    }
+                }
+                if (image->HasScaled()) {
+                    real += bytes;
+                }
+                real_bytes += real;
+                if (IsPixelFormatASTC(image->info.format)) {
+                    astc_bytes += real;
+                    // BC1/BC3 hold 0.5-1 byte a texel, the RGBA8 decode 4: over twice the BC
+                    // estimate means it was kept as RGBA8.
+                    const u64 bc_estimate = TranscodedAstcSize(
+                        (std::max)(image->guest_size_bytes, image->unswizzled_size_bytes),
+                        image->info.format);
+                    if (real > 2 * bc_estimate) {
+                        ++astc_rgba8;
+                        astc_rgba8_bytes += real;
+                    }
+                }
+                bytes = real;
+            }
+            if (debug_stats || honest) {
                 largest.emplace_back(bytes, image);
                 auto& format = by_format[static_cast<u32>(image->info.format)];
                 format.first += bytes;
@@ -724,10 +758,24 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
                  image_bytes >> 20);
+        if (honest) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache real bytes: {} MiB in images; ASTC {} MiB, of which kept as "
+                     "RGBA8 {} MiB in {} images",
+                     real_bytes >> 20, astc_bytes >> 20, astc_rgba8_bytes >> 20, astc_rgba8);
+        }
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
             const Image& image = *largest[i].second;
+            if (honest) {
+                LOG_INFO(HW_GPU, "  real {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} flags {:#x}",
+                         largest[i].first >> 20, image.gpu_addr, image.info.size.width,
+                         image.info.size.height, image.info.size.depth,
+                         image.info.resources.layers, image.info.resources.levels,
+                         static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+                continue;
+            }
             LOG_DEBUG(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
                      largest[i].first >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
                      image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
@@ -738,6 +786,11 @@ void TextureCache<P>::TickFrame() {
         for (const auto& [format, total] : by_format) formats.emplace_back(total.first, format);
         std::sort(formats.rbegin(), formats.rend());
         for (size_t i = 0; i < std::min<size_t>(8, formats.size()); ++i) {
+            if (honest) {
+                LOG_INFO(HW_GPU, "  real format {}: {} MiB in {} images", formats[i].second,
+                         formats[i].first >> 20, by_format[formats[i].second].second);
+                continue;
+            }
             LOG_DEBUG(HW_GPU, "  format {}: {} MiB in {} images", formats[i].second, formats[i].first >> 20,
                      by_format[formats[i].second].second);
         }
