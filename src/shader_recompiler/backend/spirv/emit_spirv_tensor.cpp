@@ -11,6 +11,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
@@ -175,9 +176,6 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
 } // Anonymous namespace
 
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
-    if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program)) {
-        return std::nullopt;
-    }
     bool has_hmma{};
     for (const auto* block : program.blocks) {
         for (const auto& inst : block->Instructions()) {
@@ -185,6 +183,26 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
         }
     }
     if (!has_hmma) {
+        return std::nullopt;
+    }
+    // One line per shader that has HMMA: whether it runs on the device's matrix cores or in the
+    // shader emulation, and why (diagnostic, the code paths are unchanged).
+    const auto log_path = [&](const char* path) {
+        LOG_INFO(Shader_SPIRV, "HMMA shader ({} stage, workgroup {}x{}x{}, {} B shared): {}",
+                 static_cast<u32>(program.stage), program.workgroup_size[0],
+                 program.workgroup_size[1], program.workgroup_size[2], program.shared_memory_size,
+                 path);
+    };
+    if (!profile.support_cooperative_hmma_16x16x16) {
+        log_path("emulated (no 16x16x16 cooperative matrices on this device)");
+        return std::nullopt;
+    }
+    if (!SupportsCooperativeHmma(program)) {
+        log_path(program.stage != Stage::Compute ? "emulated (not a compute shader)"
+                 : program.workgroup_size[0] == 0 ||
+                         program.workgroup_size[0] % GUEST_WARP_LANES != 0
+                     ? "emulated (workgroup width not a multiple of 32)"
+                     : "emulated (needs coherent memory)");
         return std::nullopt;
     }
     const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
@@ -195,8 +213,10 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
     // Past the device limit the pipeline would fail to build: keep the emulation.
     if (profile.max_compute_shared_memory_size != 0 &&
         total > profile.max_compute_shared_memory_size) {
+        log_path("emulated (matrix scratch would exceed shared memory)");
         return std::nullopt;
     }
+    log_path("cooperative matrices (fast path)");
     program.shared_memory_size = total;
     return scratch_offset / 4U;
 }
