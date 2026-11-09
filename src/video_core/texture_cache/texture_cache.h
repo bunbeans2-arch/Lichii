@@ -2675,6 +2675,8 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
+    // Its views are deleted: a fast draw delta draw keeping one must not follow.
+    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -4262,6 +4264,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+    if (prepare_log != nullptr) {
+        prepare_log->push_back(image_id);
+        if (prepare_log_dry) {
+            return;
+        }
+    }
     Image& image = slot_images[image_id];
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
@@ -4317,14 +4325,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
 template <class P>
 void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
                                        bool invalidate) {
-    if (!image_view_id) {
+    if (!PreparesImage(slot_image_views, image_view_id)) {
         return;
     }
-    const ImageViewBase& image_view = slot_image_views[image_view_id];
-    if (image_view.IsBuffer()) {
-        return;
-    }
-    PrepareImage(image_view.image_id, is_modification, invalidate);
+    PrepareImage(slot_image_views[image_view_id].image_id, is_modification, invalidate);
 }
 
 template <class P>
