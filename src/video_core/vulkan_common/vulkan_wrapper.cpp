@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -548,6 +549,35 @@ struct RecycledImage {
     VmaAllocation allocation;
     u64 size;
     std::chrono::steady_clock::time_point kept;
+    u64 shape = 0; ///< LICHII_IMG_RECYCLE_DIAG=1: the key without extent, levels and layers
+};
+
+/// LICHII_IMG_RECYCLE_DIAG=1: why Take found nothing, in the 10 s line. Diagnostic only.
+bool RecyclerDiag() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_IMG_RECYCLE_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+enum class DropReason : u8 { Age = 1, Cap = 2 };
+
+/// Set by KeyOf right before the same thread's Take (MemoryAllocator::AllocateImage).
+thread_local u64 t_last_shape = 0;
+/// Recyclable creations whose create info has no key (an unknown pNext), diag only.
+std::atomic<u64> g_diag_no_key{0};
+
+struct RecyclerDiagState {
+    std::unordered_map<u64, u64> shape_of; ///< key -> shape, filled by Take
+    std::unordered_map<u64, DropReason> dropped; ///< key -> why an image of it was dropped last
+    u64 miss_cold = 0;  ///< nothing of this key or shape kept or dropped
+    u64 miss_shape = 0; ///< an image of the same shape kept, other extent/levels/layers
+    u64 miss_aged = 0;  ///< an image of this key was dropped after RecycleKeepTime
+    u64 miss_cap = 0;   ///< an image of this key was dropped to make room under the cap
+    u64 put_big = 0;    ///< released images larger than the cap (destroyed)
+    u64 dropped_age_bytes = 0;
+    u64 dropped_cap_bytes = 0;
 };
 
 struct RecyclerState {
@@ -558,7 +588,16 @@ struct RecyclerState {
     u64 takes = 0;  ///< Take calls that found an image, this log window
     u64 misses = 0; ///< Take calls that found none (a new image was made)
     std::chrono::steady_clock::time_point log_since = std::chrono::steady_clock::now();
+    RecyclerDiagState diag; ///< Used only with LICHII_IMG_RECYCLE_DIAG=1
 };
+
+/// Bounds the diag maps (distinct keys of a long session).
+template <typename Map>
+void CapDiagMap(Map& map) {
+    if (map.size() > (size_t{1} << 16)) {
+        map.clear();
+    }
+}
 
 RecyclerState& Recycler() {
     static RecyclerState state;
@@ -630,6 +669,13 @@ void TrimRecycler(RecyclerState& state, u64 room, std::chrono::steady_clock::tim
     u64 bytes = state.bytes;
     while (drop < state.images.size() &&
            (now - state.images[drop].kept > RecycleKeepTime || bytes + room > RecyclerCap())) {
+        if (RecyclerDiag()) {
+            const RecycledImage& image = state.images[drop];
+            const bool aged = now - image.kept > RecycleKeepTime;
+            CapDiagMap(state.diag.dropped);
+            state.diag.dropped[image.key] = aged ? DropReason::Age : DropReason::Cap;
+            (aged ? state.diag.dropped_age_bytes : state.diag.dropped_cap_bytes) += image.size;
+        }
         bytes -= state.images[drop].size;
         ++drop;
     }
@@ -671,22 +717,44 @@ u64 ImageRecycler::KeyOf(const VkImageCreateInfo& ci, bool dedicated) noexcept {
     mix(ci.sharingMode);
     mix(ci.initialLayout);
     mix(dedicated ? 1 : 0);
+    // Diag: the same fields without extent, levels and layers ("same kind, other size").
+    const bool diag = RecyclerDiag();
+    u64 shape = 0xcbf29ce484222325ULL;
+    const auto mix_shape = [&shape](u64 value) { shape = (shape ^ value) * Mul; };
+    if (diag) {
+        mix_shape(ci.flags);
+        mix_shape(ci.imageType);
+        mix_shape(ci.format);
+        mix_shape(ci.samples);
+        mix_shape(ci.tiling);
+        mix_shape(ci.usage);
+        mix_shape(ci.sharingMode);
+        mix_shape(ci.initialLayout);
+        mix_shape(dedicated ? 1 : 0);
+    }
     if (ci.sharingMode == VK_SHARING_MODE_CONCURRENT) {
         for (u32 index = 0; index < ci.queueFamilyIndexCount; ++index) {
             mix(ci.pQueueFamilyIndices[index]);
+            mix_shape(ci.pQueueFamilyIndices[index]);
         }
     }
     for (auto* next = static_cast<const VkBaseInStructure*>(ci.pNext); next != nullptr;
          next = next->pNext) {
         if (next->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            if (diag) {
+                g_diag_no_key.fetch_add(1, std::memory_order_relaxed);
+            }
             return 0;
         }
         const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
         mix(list->viewFormatCount);
+        mix_shape(list->viewFormatCount);
         for (u32 index = 0; index < list->viewFormatCount; ++index) {
             mix(list->pViewFormats[index]);
+            mix_shape(list->pViewFormats[index]);
         }
     }
+    t_last_shape = diag ? shape : 0;
     return key == 0 ? 1 : key;
 }
 
@@ -694,17 +762,26 @@ bool ImageRecycler::Put(u64 key, VmaAllocator allocator, VkImage handle,
                         VmaAllocation allocation) noexcept {
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(allocator, allocation, &info);
+    RecyclerState& state = Recycler();
     if (info.size > RecyclerCap()) {
+        if (RecyclerDiag()) {
+            std::scoped_lock lock{state.mutex};
+            ++state.diag.put_big;
+        }
         return false;
     }
-    RecyclerState& state = Recycler();
     std::scoped_lock lock{state.mutex};
     if (state.closed == allocator) {
         return false;
     }
     const auto now = std::chrono::steady_clock::now();
     TrimRecycler(state, info.size, now);
-    state.images.push_back({key, allocator, handle, allocation, info.size, now});
+    u64 shape = 0;
+    if (RecyclerDiag()) {
+        const auto it = state.diag.shape_of.find(key);
+        shape = it != state.diag.shape_of.end() ? it->second : 0;
+    }
+    state.images.push_back({key, allocator, handle, allocation, info.size, now, shape});
     state.bytes += info.size;
     return true;
 }
@@ -732,6 +809,29 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
     }
     const auto now = std::chrono::steady_clock::now();
     ++(found ? state.takes : state.misses);
+    if (RecyclerDiag()) {
+        RecyclerDiagState& diag = state.diag;
+        const u64 shape = t_last_shape;
+        if (shape != 0) {
+            CapDiagMap(diag.shape_of);
+            diag.shape_of[key] = shape;
+        }
+        if (!found) {
+            const auto dropped = diag.dropped.find(key);
+            if (dropped != diag.dropped.end()) {
+                ++(dropped->second == DropReason::Cap ? diag.miss_cap : diag.miss_aged);
+                diag.dropped.erase(dropped);
+            } else if (shape != 0 &&
+                       std::any_of(state.images.begin(), state.images.end(),
+                                   [shape, allocator](const RecycledImage& image) {
+                                       return image.shape == shape && image.allocator == allocator;
+                                   })) {
+                ++diag.miss_shape;
+            } else {
+                ++diag.miss_cold;
+            }
+        }
+    }
     if (now - state.log_since >= std::chrono::seconds{10}) {
         const double seconds = std::chrono::duration<double>(now - state.log_since).count();
         LOG_INFO(Render_Vulkan,
@@ -740,6 +840,20 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
                  seconds, state.takes, state.takes / seconds, state.misses,
                  state.misses / seconds, state.images.size(),
                  static_cast<double>(state.bytes) / (1 << 20));
+        if (RecyclerDiag()) {
+            RecyclerDiagState& diag = state.diag;
+            LOG_INFO(Render_Vulkan,
+                     "Image recycler misses: {} cold, {} other size (same shape kept), {} aged "
+                     "out, {} cap drop; {} no key, {} too big; dropped {:.1f} MiB aged, {:.1f} "
+                     "MiB for cap; cap {:.0f} MiB",
+                     diag.miss_cold, diag.miss_shape, diag.miss_aged, diag.miss_cap,
+                     g_diag_no_key.exchange(0, std::memory_order_relaxed), diag.put_big,
+                     static_cast<double>(diag.dropped_age_bytes) / (1 << 20),
+                     static_cast<double>(diag.dropped_cap_bytes) / (1 << 20),
+                     static_cast<double>(RecyclerCap()) / (1 << 20));
+            diag.miss_cold = diag.miss_shape = diag.miss_aged = diag.miss_cap = 0;
+            diag.put_big = diag.dropped_age_bytes = diag.dropped_cap_bytes = 0;
+        }
         state.takes = 0;
         state.misses = 0;
         state.log_since = now;
