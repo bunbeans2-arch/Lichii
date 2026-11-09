@@ -21,6 +21,7 @@
 #include <bit>
 #include <numeric>
 #include "common/cityhash.h"
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -2192,6 +2193,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
     total += elapsed;
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::g_pipelines);
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::g_pipeline_us,
+                          static_cast<u64>(
+                              std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
     ++count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to

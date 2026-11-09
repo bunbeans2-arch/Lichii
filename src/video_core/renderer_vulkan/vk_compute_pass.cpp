@@ -17,6 +17,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
@@ -838,12 +839,14 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         }
         batched_bytes = 0;
         ++submits;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_astc_submits);
     }
     const auto end = std::chrono::steady_clock::now();
     static u32 decodes{};
     static std::chrono::nanoseconds waited{};
     static auto window_start = end;
     ++decodes;
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::g_astc_decodes);
     waited += end - start;
     if (end - window_start >= std::chrono::seconds{5}) {
         LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({}), {} submits",

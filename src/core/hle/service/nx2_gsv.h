@@ -28,6 +28,7 @@
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
+#include "common/nx2_hitch.h"
 #include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -1868,6 +1869,7 @@ private:
                 const long long frame = to_us(entered - m_stats.last_present);
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
+                Common::Nx2Hitch::NoteFrame(frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
             }
             m_stats.last_present = entered;

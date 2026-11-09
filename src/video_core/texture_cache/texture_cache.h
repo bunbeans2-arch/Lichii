@@ -21,6 +21,7 @@
 
 #include "common/alignment.h"
 #include "common/cityhash.h"
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -166,6 +167,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_gc_deletes);
         hash_log_reason = HashLogReason::Gc;
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         hash_log_reason = HashLogReason::Other;
@@ -176,6 +178,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         runtime.Finish();
         ++gc_download_waits;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_download_waits);
         for (PendingDownload& entry : pending) {
             Image& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
@@ -2254,6 +2257,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::g_upload_bytes, image.guest_size_bytes);
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
     if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
@@ -2391,6 +2395,7 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         runtime.InsertUploadMemoryBarrier();
         ++images_uploaded;
         uploaded_bytes += bytes;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_upload_bytes, bytes);
     }
 }
 
@@ -2515,6 +2520,8 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             image.UploadMemory(staging, copies);
             ++images_uploaded;
             uploaded_bytes += u64{image.info.layer_stride} * layers.size();
+            Common::Nx2Hitch::Add(Common::Nx2Hitch::g_upload_bytes,
+                                  u64{image.info.layer_stride} * layers.size());
             ++layer_uploads;
             return;
         }
@@ -2536,6 +2543,7 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         runtime.AccelerateImageUploadLayers(image, staging, uploads, layers);
         ++images_uploaded;
         uploaded_bytes += tail * layers.size();
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_upload_bytes, tail * layers.size());
         ++layer_uploads;
     }
 }
@@ -3191,6 +3199,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             shape.second = gpu_addr;
         }
         ++images_created;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::g_images_created);
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
@@ -4087,6 +4096,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     }
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::g_images_deleted);
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
